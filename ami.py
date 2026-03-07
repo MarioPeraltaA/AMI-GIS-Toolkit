@@ -21,6 +21,7 @@ import numpy as np
 import folium
 
 
+@dataclass
 class GIS(ABC):
     """Abstract GIS contract.
 
@@ -28,12 +29,67 @@ class GIS(ABC):
 
     """
 
+    gdf: gpd.GeoDataFrame | None = None
+
     @abstractmethod
     def load_gis(self):
         """Read *GIS* of each meter."""
         ...
 
+    def test_domain(
+            self,
+            other: object,
+            domain_label: str = "NodeID"
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """Compare data classes.
 
+        Run a diagnosis of inconsistencies
+        between two data classes and extract them all.
+
+        +------------+-------------------------------+
+        | state      | meaning                       |
+        +============+===============================+
+        | both       | consistent identifiers        |
+        +------------+-------------------------------+
+        | left_only  | Table A - only identifiers    |
+        +------------+-------------------------------+
+        | right_only | Table B - only identifiers    |
+        +------------+-------------------------------+
+
+        .. warning::
+
+            Make sure domain field is label the same
+            in both structures.
+
+        """
+        col = domain_label
+        table_a = self.gdf
+        if isinstance(other, GIS) and col == "NISE":
+            table_b = other.gdf
+            table_b.rename(
+                columns={"OBJECTID": domain_label},
+                inplace=True
+            )
+        elif isinstance(other, AMI):
+            table_b = other.df
+        elif isinstance(other, pd.DataFrame):
+            table_b = other
+
+        table_a_keys = table_a[[col]].drop_duplicates()
+        table_b_keys = table_b[[col]].drop_duplicates()
+        diff = (
+            table_a_keys
+            .merge(table_b_keys, on=col, how='outer', indicator=True)
+        )
+        in_a_not_b = diff.loc[diff['_merge'] == 'left_only', col]
+        in_b_not_a = diff.loc[diff['_merge'] == 'right_only', col]
+        return (
+            in_a_not_b,
+            in_b_not_a
+        )
+
+
+@dataclass
 class AMI(ABC):
     """Abstract AMI device.
 
@@ -41,6 +97,8 @@ class AMI(ABC):
     **NISE** and ``LOCALIZACION_REAL`` the actual location code.
 
     """
+
+    df: pd.DataFrame | None = None
 
     @abstractmethod
     def load_data(self):
@@ -52,6 +110,59 @@ class AMI(ABC):
         """Process some datatype and columns name."""
         ...
 
+    def test_domain(
+            self,
+            other: object,
+            domain_label: str = "NodeID"
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """Compare data classes.
+
+        Run a diagnosis of inconsistencies
+        between two data classes and extract them all.
+
+        +------------+-------------------------------+
+        | state      | meaning                       |
+        +============+===============================+
+        | both       | consistent identifiers        |
+        +------------+-------------------------------+
+        | left_only  | Table A - only identifiers    |
+        +------------+-------------------------------+
+        | right_only | Table B - only identifiers    |
+        +------------+-------------------------------+
+
+        .. warning::
+
+            Make sure domain field is label the same
+            in both structures.
+
+        """
+        col = domain_label
+        table_a = self.df
+        if isinstance(other, GIS) and col == "NISE":
+            # table_b = other.layers['Loads'][0]
+            table_b = other.gdf
+            table_b.rename(
+                columns={"OBJECTID": domain_label},
+                inplace=True
+            )
+        elif isinstance(other, AMI):
+            table_b = other.df
+        elif isinstance(other, pd.DataFrame):
+            table_b = other
+
+        table_a_keys = table_a[[col]].drop_duplicates()
+        table_b_keys = table_b[[col]].drop_duplicates()
+        diff = (
+            table_a_keys
+            .merge(table_b_keys, on=col, how='outer', indicator=True)
+        )
+        in_a_not_b = diff.loc[diff['_merge'] == 'left_only', col]
+        in_b_not_a = diff.loc[diff['_merge'] == 'right_only', col]
+        return (
+            in_a_not_b,
+            in_b_not_a
+        )
+
 
 @dataclass
 class GISCircuit(GIS):
@@ -62,6 +173,7 @@ class GISCircuit(GIS):
         default_factory=dict
     )
     per_slice: int | None = None
+    costumers_layer_name: str = "Loads"
 
     def __post_init__(
             self
@@ -69,21 +181,34 @@ class GISCircuit(GIS):
         """Initialize GIS data structure."""
         self.load_gis()
         self.paint_layers()
+        self.gdf = self.layers[self.costumers_layer_name][0]
+        self.gdf.rename(
+            columns={"OBJECTID": "NISE"}, inplace=True
+        )
 
     def set_layer(
             self,
-            gdf: gpd.GeoDataFrame
+            gdf: gpd.GeoDataFrame,
+            rename_cols: dict[str, str] | None = None
     ) -> gpd.GeoDataFrame:
         """Customize a tiny bit current layer."""
         if "IDLOCALIZA" in gdf.columns:
             gdf['IDLOCALIZA'] = gdf['IDLOCALIZA'].astype("Int64")
+        if rename_cols:
+            gdf.rename(
+                columns=rename_cols, inplace=True
+            )
         return gdf
 
     def read_gis(
         self,
         path: str,
         epsg: int = 5367,
-        to_local: bool = True
+        to_local: bool = True,
+        rename_cols: dict[str, str] | None = {
+            "IDLOCALIZA": "LOCALIZACION_REAL",
+            "NUMEROMEDI": "MEDIDOR"
+        }
     ) -> gpd.GeoDataFrame | None:
         """Read a GIS file and return a GeoDataFrame with a consistent CRS.
 
@@ -109,7 +234,7 @@ class GISCircuit(GIS):
         """
         try:
             gdf = gpd.read_file(path)
-            gdf = self.set_layer(gdf)
+            gdf = self.set_layer(gdf, rename_cols=rename_cols)
         except Exception as e:
             print(f"Error reading GIS file '{path}': {e}")
             return None
@@ -273,6 +398,8 @@ class ConsumptionData(AMI):
         """Initiate data type."""
         self.load_data()
         self.set_energy_df()
+        if self.gis:
+            _ = self.put_geometry()
 
     def set_df(
             self,
@@ -284,7 +411,7 @@ class ConsumptionData(AMI):
         df.rename(columns={"LOCALIZACION": "NISE"}, inplace=True)
         # Number type
         df['VALOR_LECTURA'] = df['VALOR_LECTURA'].astype("float")
-        df['MEDIDOR'] = df['MEDIDOR'].astype("int64")            # ID
+        df['MEDIDOR'] = df['MEDIDOR'].astype("Int64")            # ID
         df['LOCALIZACION_REAL'] = df['LOCALIZACION_REAL'].astype("Int64")
         df['FECHA_LECTURA'] = df['FECHA_LECTURA_REAL']    # Switch columns
         # Add "Hour" column
@@ -375,7 +502,7 @@ class ConsumptionData(AMI):
         """
         df = pd.read_parquet(self.data_path)
         df = self.set_df(df)
-        self.df = df.copy()    # Copy
+        self.df = df.copy()    # Deep copy
         # Without transformer meters
         df = df[df.SGDA.isin([None, "Bidireccional"])]
         # ENE and MDE
@@ -428,7 +555,9 @@ class ConsumptionData(AMI):
         return gr
 
     def put_geometry(
-            self
+            self,
+            node_col_label: str = "MEDIDOR",
+            geo_of_col: str = "LOCALIZACION_REAL"
     ) -> gpd.GeoDataFrame:
         """Map meter location to actual geometry point.
 
@@ -445,24 +574,24 @@ class ConsumptionData(AMI):
 
         """
         gdf = self.gis.layers['Loads'][0]   # Retrieve costumers location
-        # to_geom = dict(zip(gdf['OBJECTID'], gdf['geometry']))
-        to_geom = dict(zip(gdf['IDLOCALIZA'], gdf['geometry']))
+        # to_geom = dict(zip(gdf['IDLOCALIZA'], gdf['geometry']))
+        to_geom = dict(zip(gdf[geo_of_col], gdf['geometry']))
         # ami_df = (
         #     self.df[['MEDIDOR', 'NISE']]
         #     .drop_duplicates()
         # )
         ami_df = (
-            self.df[['MEDIDOR', 'LOCALIZACION_REAL']]
+            self.df[[node_col_label, geo_of_col]]
             .drop_duplicates()
         )
         # Remove ami with no location id
         ami_df = (
-            ami_df[ami_df['LOCALIZACION_REAL'].notna()]
+            ami_df[ami_df[geo_of_col].notna()]
             .reset_index(drop=True)
         )
         # Map id to actual geometry (Point)
         ami_df['geometry'] = (
-            ami_df['LOCALIZACION_REAL'].map(to_geom)
+            ami_df[geo_of_col].map(to_geom)
         )
         # Remove ami with no geometry
         ami_df = (
@@ -488,7 +617,8 @@ class VoltageData(AMI):
     **Expected Sampling Frequency:**
     Voltage measurements are generally expected every 5, 10, or 15 minutes.
     However, only a limited number of key customers may have meters configured
-    to record voltage at such high temporal resolution.
+    to record voltage at such high temporal resolution. Further more
+    it looks like most of them measure only at one phase.
 
     Attributes
     ----------
@@ -509,6 +639,9 @@ class VoltageData(AMI):
     """
 
     data_path: str = "./Data/Voltages"
+    phase_vals: list[str] = field(
+        default_factory=["Phase A Average RMS Voltage"]
+    )
     gis: GISCircuit | None = None
     df: pd.DataFrame | None = None
     voltage_data: pd.DataFrame | None = None
@@ -524,8 +657,7 @@ class VoltageData(AMI):
 
     def set_df(
             self,
-            df: pd.DataFrame,
-            phases: list[str] = ["Phase A Average RMS Voltage"]
+            df: pd.DataFrame
     ) -> pd.DataFrame:
         """Process datatype."""
         df['LOCALIZACION'] = df['LOCALIZACION'].astype("Int64")  # NISE
@@ -534,7 +666,7 @@ class VoltageData(AMI):
         df['VALOR_LECTURA'] = df['VALOR_LECTURA'].astype("float")
         df['MEDIDOR'] = df['MEDIDOR'].astype("int64")            # ID
         df['FECHA_LECTURA'] = df['FECHA_LECTURA_REAL']    # Switch columns
-        df = df[df.UNIDAD.isin(phases)]
+        df = df[df.UNIDAD.isin(self.phase_vals)]
         df = (
             df.sort_values(by=["MEDIDOR", "FECHA_LECTURA"])
             .reset_index(drop=True)
@@ -804,7 +936,7 @@ class ScenariosManager(ABC):
 class CityScenarios(ScenariosManager):
     """Smart City and Microgrid loadshapes.
 
-    Vitual potential realities sort to speak, in case of
+    Vitual potential realities so to speak, in case of
     a University campus these could be the scenarios:
 
         - Weekdays of each academic season.
@@ -815,7 +947,7 @@ class CityScenarios(ScenariosManager):
     """
 
     season_curves: pd.DataFrame | None = None   # Weekdays only
-    weekends_curve : pd.DataFrame | None = None
+    weekends_curve: pd.DataFrame | None = None
     sdata: pd.DataFrame = field(init=False)
 
     def __post_init__(self):
