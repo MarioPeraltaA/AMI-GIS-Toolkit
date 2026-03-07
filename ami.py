@@ -19,6 +19,7 @@ import glob
 import matplotlib.pyplot as plt
 import numpy as np
 import folium
+import json
 
 
 @dataclass
@@ -65,15 +66,17 @@ class GIS(ABC):
         col = domain_label
         table_a = self.gdf
         if isinstance(other, GIS) and col == "NISE":
-            table_b = other.gdf
+            table_b = other.gdf.copy(deep=True)
             table_b.rename(
                 columns={"OBJECTID": domain_label},
                 inplace=True
             )
         elif isinstance(other, AMI):
-            table_b = other.df
+            table_b = other.df.copy(deep=True)
         elif isinstance(other, pd.DataFrame):
-            table_b = other
+            table_b = other.copy(deep=True)
+        elif isinstance(other, InfoClientManager):
+            table_b = other.df.copy(deep=True)
 
         table_a_keys = table_a[[col]].drop_duplicates()
         table_b_keys = table_b[[col]].drop_duplicates()
@@ -140,15 +143,17 @@ class AMI(ABC):
         table_a = self.df
         if isinstance(other, GIS) and col == "NISE":
             # table_b = other.layers['Loads'][0]
-            table_b = other.gdf
+            table_b = other.gdf.copy(deep=True)
             table_b.rename(
                 columns={"OBJECTID": domain_label},
                 inplace=True
             )
         elif isinstance(other, AMI):
-            table_b = other.df
+            table_b = other.df.copy(deep=True)
         elif isinstance(other, pd.DataFrame):
-            table_b = other
+            table_b = other.copy(deep=True)
+        elif isinstance(other, InfoClientManager):
+            table_b = other.df.copy(deep=True)
 
         table_a_keys = table_a[[col]].drop_duplicates()
         table_b_keys = table_b[[col]].drop_duplicates()
@@ -162,6 +167,94 @@ class AMI(ABC):
             in_a_not_b,
             in_b_not_a
         )
+
+
+@dataclass
+class InfoClientManager(ABC):
+    """Database of some utility's costumers."""
+
+    df: pd.DataFrame | None = None
+
+    @abstractmethod
+    def read_costumers_data(
+        self
+    ):
+        """Load information data of utility's costumers."""
+        ...
+
+
+@dataclass
+class CNFLCostumers(InfoClientManager):
+    """Database of CNFL utility."""
+
+    database_path: str = "./Data/Costumers/Infoclientes.txt"
+    datatype_path: str = "./Data/Costumers/datatype.json"
+    columns_dtype: dict = field(init=False)
+    df: pd.DataFrame = field(init=False)
+
+    def __post_init__(
+            self
+    ):
+        """Instantiate company's costumers database."""
+        self.df = self.read_costumers_data()
+
+    def set_columns_data_type(
+            self,
+    ) -> dict | None:
+        """Map each column to suitable data type."""
+        try:
+            with open(self.datatype_path, "r", encoding="utf-8") as f:
+                dtype_map = json.load(f)
+        except FileNotFoundError:
+            print(f"Error: The file '{self.datatype_path}' was not found.")
+            return
+        except json.JSONDecodeError as e:
+            print(f"Error: Failed to decode JSON from the file. Details: {e}")
+            return
+        else:
+            self.columns_dtype = dtype_map
+            return dtype_map
+
+    def process_info_data(
+            self,
+            info_df: pd.DataFrame
+    ):
+        """Clean up and normalize costumers dataset."""
+        date_cols: list[str] = [
+            "FEC_INST_NISE",
+            "FECHA_LECTURA",
+            # "FECHA_DESDE",
+            "FECHA_HASTA",
+            "FECHA_CONEXION_RED",
+            "FEC_INST_MED",
+            "FECHA_INTER",
+        ]
+        for col in date_cols:
+            info_df[col] = pd.to_datetime(
+                info_df[col],
+                format="%Y%m%d",
+                errors="coerce"
+            )
+
+        info_df['NISE'] = (
+            info_df['NISE'].str.strip()
+            .replace(r"^(\d+),0+$", r"\1", regex=True)
+            .astype("Int64")
+        )
+        return info_df
+
+    def read_costumers_data(
+            self
+    ) -> pd.DataFrame:
+        """Load and process CNFL's Infoclientes file."""
+        dtype_map = self.set_columns_data_type()
+        info_df = pd.read_csv(
+            self.database_path,
+            sep=";",
+            dtype=dtype_map
+        )
+        info_df = self.process_info_data(info_df)
+        return info_df
 
 
 @dataclass
