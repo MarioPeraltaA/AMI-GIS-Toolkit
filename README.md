@@ -223,4 +223,73 @@ ami.py             (GISCircuit, ConsumptionData, VoltageData, PowerData, Scenari
 README.md
 ```
 
+# Migration to Databricks
+
+“Databricks‑ready” restructuring of `ami.py` module:
+
+- It keeps **domain model** (`AMI`, `GIS`, etc.) but
+- replace pandas/geopandas logic with **Spark DataFrame / SQL** where it matters for scale,
+- assume the raw data lives in **Delta tables** (or is at least read via Spark).
+
+So it can be moved into a Databricks repo (as `bigami.py`) and import it in notebooks.
+
+It focuses on the heavy/tabular parts (`test_domain`, `ConsumptionData`, `VoltageData`, `PowerData`, `CityScenarios`). GIS/folium/geopandas parts usually stay local/driver‑side; So they are left largely as-is but note how to integrate with Spark when needed.
+
 ---
+
+## 1. Spark-based `test_domain`
+
+### Conceptual change
+
+- Instead of accepting pandas `DataFrame`, use **Spark DataFrames** (`pyspark.sql.DataFrame`).
+- Use `select().distinct()` for keys and **full outer join** to get `left_only` / `right_only`.
+- Return Spark DataFrames (or a pair of column-only DataFrames).
+
+
+---
+
+## 2. How to use this in Databricks
+
+### 2.1. Put in a repo / workspace
+
+1. In Databricks, create a repo (e.g. `energy-analytics`).
+2. Add `ami_spark.py` with the content above.
+3. Attach a Photon-enabled cluster.
+
+### 2.2. Example notebook usage
+
+```python
+# In a Databricks notebook cell
+
+from ami_spark import ConsumptionData, VoltageData, PowerData, CityScenarios
+
+# Make sure these Delta tables exist and are optimized:
+# - ami.consumption
+# - ami.voltages
+# - ami.power
+
+cons = ConsumptionData(table_name="ami.consumption")
+volt = VoltageData(table_name="ami.voltages")
+pwr  = PowerData(table_name="ami.power")
+
+# Example: domain consistency between consumption and voltages on MEDIDOR
+in_cons_not_volt, in_volt_not_cons = cons.test_domain(volt, domain_label="MEDIDOR")
+
+display(in_cons_not_volt)
+display(in_volt_not_cons)
+
+# Build city scenarios from active power
+# Assume cons.energy_df or pwr.active_df includes 'node','ts','P'
+# For example, from active_df:
+p_active = pwr.active_df  # columns: node, ts, P_Pdem, P_Pgen, etc.
+p_for_scen = p_active.select("node", "ts", F.col("P_Pdem").alias("P"))
+
+from ami_spark import CityScenarios
+city = CityScenarios(sdf=p_for_scen)
+
+weekends = city.get_weekends_curve(power="P")
+seasons  = city.avg_curves(power="P")
+
+display(weekends)
+display(seasons)
+```
