@@ -286,7 +286,9 @@ class GISCircuit(GIS):
     ) -> gpd.GeoDataFrame:
         """Customize a tiny bit current layer."""
         if "IDLOCALIZA" in gdf.columns:
-            gdf['IDLOCALIZA'] = gdf['IDLOCALIZA'].astype("Int64")
+            gdf["IDLOCALIZA"] = pd.to_numeric(
+                gdf["IDLOCALIZA"], errors="coerce"
+            ).astype("Int64")
         if rename_cols:
             gdf.rename(
                 columns=rename_cols, inplace=True
@@ -494,26 +496,44 @@ class ConsumptionData(AMI):
         if self.gis:
             _ = self.put_geometry()
 
-    def set_df(
-            self,
-            df: pd.DataFrame
-    ) -> pd.DataFrame:
+    def set_df(self, df: pd.DataFrame) -> pd.DataFrame:
         """Process datatype and add hour column."""
-        df['CONTADOR'] = df['CONTADOR'].str.lower()
-        df['LOCALIZACION'] = df['LOCALIZACION'].astype("Int64")  # NISE
+        # CONTADOR as lowercase string (robust against non-strings)
+        df["CONTADOR"] = df["CONTADOR"].astype(str).str.lower()
+
+        # LOCALIZACION → NISE (nullable Int64, safe coercion)
+        df["LOCALIZACION"] = pd.to_numeric(df["LOCALIZACION"], errors="coerce")
+        df["LOCALIZACION"] = df["LOCALIZACION"].astype("Int64")
         df.rename(columns={"LOCALIZACION": "NISE"}, inplace=True)
-        # Number type
-        df['VALOR_LECTURA'] = df['VALOR_LECTURA'].astype("float")
-        df['MEDIDOR'] = df['MEDIDOR'].astype("Int64")            # ID
-        df['LOCALIZACION_REAL'] = df['LOCALIZACION_REAL'].astype("Int64")
-        df['FECHA_LECTURA'] = df['FECHA_LECTURA_REAL']    # Switch columns
-        # Add "Hour" column
-        seconds_s = (
-            (df['FECHA_LECTURA'].dt.hour * 3600.0)
-            + (df['FECHA_LECTURA'].dt.minute * 60.0)
-            + (df['FECHA_LECTURA'].dt.second)
+
+        # VALOR_LECTURA as float (safe coercion)
+        df["VALOR_LECTURA"] = pd.to_numeric(
+            df["VALOR_LECTURA"], errors="coerce"
         )
-        df['Hour'] = seconds_s / 3600.0
+
+        # MEDIDOR as nullable integer
+        df["MEDIDOR"] = pd.to_numeric(
+            df["MEDIDOR"], errors="coerce"
+        ).astype("Int64")
+
+        # LOCALIZACION_REAL as nullable integer
+        df["LOCALIZACION_REAL"] = (
+            pd.to_numeric(
+                df["LOCALIZACION_REAL"], errors="coerce"
+            ).astype("Int64")
+        )
+
+        # FECHA_LECTURA from FECHA_LECTURA_REAL
+        df["FECHA_LECTURA"] = df["FECHA_LECTURA_REAL"]
+
+        # Add "Hour" column (handle possible NaT safely)
+        seconds_s = (
+            df["FECHA_LECTURA"].dt.hour.fillna(0) * 3600.0
+            + df["FECHA_LECTURA"].dt.minute.fillna(0) * 60.0
+            + df["FECHA_LECTURA"].dt.second.fillna(0)
+        )
+        df["Hour"] = seconds_s / 3600.0
+
         return df
 
     def split_ene_mde(
@@ -748,18 +768,30 @@ class VoltageData(AMI):
         self.load_data()
         self.set_voltage_df()
 
-    def set_df(
-            self,
-            df: pd.DataFrame
-    ) -> pd.DataFrame:
+    def set_df(self, df: pd.DataFrame) -> pd.DataFrame:
         """Process datatype."""
-        df['LOCALIZACION'] = df['LOCALIZACION'].astype("Int64")  # NISE
+        # LOCALIZACION → NISE with safe coercion
+        df["LOCALIZACION"] = pd.to_numeric(df["LOCALIZACION"], errors="coerce")
+        df["LOCALIZACION"] = df["LOCALIZACION"].astype("Int64")
         df.rename(columns={"LOCALIZACION": "NISE"}, inplace=True)
-        # Number type
-        df['VALOR_LECTURA'] = df['VALOR_LECTURA'].astype("float")
-        df['MEDIDOR'] = df['MEDIDOR'].astype("int64")            # ID
-        df['FECHA_LECTURA'] = df['FECHA_LECTURA_REAL']    # Switch columns
-        df = df[df.UNIDAD.isin(self.phase_vals)]
+
+        # VALOR_LECTURA as float
+        df["VALOR_LECTURA"] = pd.to_numeric(
+            df["VALOR_LECTURA"], errors="coerce"
+        )
+
+        # MEDIDOR as int (or Int64 if you prefer nullable)
+        df["MEDIDOR"] = pd.to_numeric(
+            df["MEDIDOR"], errors="coerce"
+        ).astype("Int64")
+
+        # FECHA_LECTURA from FECHA_LECTURA_REAL
+        df["FECHA_LECTURA"] = df["FECHA_LECTURA_REAL"]
+
+        # Filter by selected phase values (handle possible non-string UNIDAD)
+        df["UNIDAD"] = df["UNIDAD"].astype(str)
+        df = df[df["UNIDAD"].isin(self.phase_vals)]
+
         df = (
             df.sort_values(by=["MEDIDOR", "FECHA_LECTURA"])
             .reset_index(drop=True)
@@ -852,18 +884,33 @@ class PowerData(AMI):
         self.set_active_df()
         self.set_reactive_df()
 
-    def set_df(
-            self,
-            df: pd.DataFrame
-    ) -> pd.DataFrame:
+    def set_df(self, df: pd.DataFrame) -> pd.DataFrame:
         """Process datatype."""
-        df['LOCALIZACION'] = df['LOCALIZACION'].astype("Int64")  # NISE
+        # LOCALIZACION → NISE with safe coercion
+        df["LOCALIZACION"] = pd.to_numeric(df["LOCALIZACION"], errors="coerce")
+        df["LOCALIZACION"] = df["LOCALIZACION"].astype("Int64")
         df.rename(columns={"LOCALIZACION": "NISE"}, inplace=True)
-        # Number type
-        df['VALOR_LECTURA'] = df['VALOR_LECTURA'].astype("float")
-        df['MEDIDOR'] = df['MEDIDOR'].astype("int64")            # ID
-        df['LOCALIZACION_REAL'] = df['LOCALIZACION_REAL'].astype("Int64")
-        df['FECHA_LECTURA'] = df['FECHA_LECTURA_REAL']    # Switch columns
+
+        # VALOR_LECTURA as float
+        df["VALOR_LECTURA"] = pd.to_numeric(
+            df["VALOR_LECTURA"], errors="coerce"
+        )
+
+        # MEDIDOR as nullable integer
+        df["MEDIDOR"] = pd.to_numeric(
+            df["MEDIDOR"], errors="coerce"
+        ).astype("Int64")
+
+        # LOCALIZACION_REAL as nullable integer
+        df["LOCALIZACION_REAL"] = (
+            pd.to_numeric(
+                df["LOCALIZACION_REAL"], errors="coerce"
+            ).astype("Int64")
+        )
+
+        # FECHA_LECTURA from FECHA_LECTURA_REAL
+        df["FECHA_LECTURA"] = df["FECHA_LECTURA_REAL"]
+
         df = (
             df.sort_values(by=["MEDIDOR", "FECHA_LECTURA"])
             .reset_index(drop=True)

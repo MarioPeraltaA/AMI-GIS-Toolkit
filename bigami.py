@@ -36,18 +36,20 @@ class GIS(ABC):
         other: object,
         domain_label: str = "NodeID"
     ) -> Tuple[DataFrame, DataFrame]:
-        """Compare identifiers between this GIS and another object.
+        """Compare identifiers between this dataset and another object.
 
         Returns:
         - in_a_not_b: ids present only in this sdf
         - in_b_not_a: ids present only in other's df/sdf
+
+        Casting is done to string to avoid numeric cast errors.
 
         """
         col = domain_label
         table_a = self.sdf
 
         if table_a is None:
-            raise ValueError("self.sdf is None. Load GIS data first.")
+            raise ValueError("self.sdf is None. Load data first.")
 
         # Resolve other into a Spark DataFrame
         if isinstance(other, GIS) and col == "NISE":
@@ -64,19 +66,40 @@ class GIS(ABC):
         if table_b is None:
             raise ValueError("Other object does not have a Spark DataFrame loaded.")
 
-        # Distinct keys
-        a_keys = table_a.select(col).distinct().alias("a")
-        b_keys = table_b.select(col).distinct().alias("b")
-
-        # Full outer join to detect existence differences
-        diff = (
-            a_keys.join(b_keys, on=[col], how="outer")
+        # Force comparison on string representation to avoid CAST errors
+        a_keys = (
+            table_a
+            .select(F.col(col).cast("string").alias(col))
+            .distinct()
+            .withColumnRenamed(col, f"a_{col}")
+        )
+        b_keys = (
+            table_b
+            .select(F.col(col).cast("string").alias(col))
+            .distinct()
+            .withColumnRenamed(col, f"b_{col}")
         )
 
-        # In A not B: B side is null
-        in_a_not_b = diff.filter(F.col(f"b.{col}").isNull()).select(F.col(f"a.{col}").alias(col))
-        # In B not A: A side is null
-        in_b_not_a = diff.filter(F.col(f"a.{col}").isNull()).select(F.col(f"b.{col}").alias(col))
+        # Full outer join on string key
+        diff = a_keys.join(
+            b_keys,
+            on=a_keys[f"a_{col}"] == b_keys[f"b_{col}"],
+            how="outer"
+        )
+
+        # Present only in A: b side is null
+        in_a_not_b = (
+            diff
+            .filter(F.col(f"b_{col}").isNull())
+            .select(F.col(f"a_{col}").alias(col))
+        )
+
+        # Present only in B: a side is null
+        in_b_not_a = (
+            diff
+            .filter(F.col(f"a_{col}").isNull())
+            .select(F.col(f"b_{col}").alias(col))
+        )
 
         return in_a_not_b, in_b_not_a
 
@@ -114,7 +137,7 @@ class AMI(ABC):
         table_a = self.sdf
 
         if table_a is None:
-            raise ValueError("self.sdf is None. Load AMI data first.")
+            raise ValueError("self.sdf is None. Load data first.")
 
         # Resolve other into a Spark DataFrame
         if isinstance(other, GIS) and col == "NISE":
@@ -131,15 +154,40 @@ class AMI(ABC):
         if table_b is None:
             raise ValueError("Other object does not have a Spark DataFrame loaded.")
 
-        a_keys = table_a.select(col).distinct().alias("a")
-        b_keys = table_b.select(col).distinct().alias("b")
-
-        diff = (
-            a_keys.join(b_keys, on=[col], how="outer")
+        # Force comparison on string representation to avoid CAST errors
+        a_keys = (
+            table_a
+            .select(F.col(col).cast("string").alias(col))
+            .distinct()
+            .withColumnRenamed(col, f"a_{col}")
+        )
+        b_keys = (
+            table_b
+            .select(F.col(col).cast("string").alias(col))
+            .distinct()
+            .withColumnRenamed(col, f"b_{col}")
         )
 
-        in_a_not_b = diff.filter(F.col(f"b.{col}").isNull()).select(F.col(f"a.{col}").alias(col))
-        in_b_not_a = diff.filter(F.col(f"a.{col}").isNull()).select(F.col(f"b.{col}").alias(col))
+        # Full outer join on string key
+        diff = a_keys.join(
+            b_keys,
+            on=a_keys[f"a_{col}"] == b_keys[f"b_{col}"],
+            how="outer"
+        )
+
+        # Present only in A: b side is null
+        in_a_not_b = (
+            diff
+            .filter(F.col(f"b_{col}").isNull())
+            .select(F.col(f"a_{col}").alias(col))
+        )
+
+        # Present only in B: a side is null
+        in_b_not_a = (
+            diff
+            .filter(F.col(f"a_{col}").isNull())
+            .select(F.col(f"b_{col}").alias(col))
+        )
 
         return in_a_not_b, in_b_not_a
 
