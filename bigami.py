@@ -36,20 +36,18 @@ class GIS(ABC):
         other: object,
         domain_label: str = "NodeID"
     ) -> Tuple[DataFrame, DataFrame]:
-        """Compare identifiers between this dataset and another object.
+        """Compare identifiers between this GIS and another object.
 
         Returns:
         - in_a_not_b: ids present only in this sdf
         - in_b_not_a: ids present only in other's df/sdf
-
-        Casting is done to string to avoid numeric cast errors.
 
         """
         col = domain_label
         table_a = self.sdf
 
         if table_a is None:
-            raise ValueError("self.sdf is None. Load data first.")
+            raise ValueError("self.sdf is None. Load GIS data first.")
 
         # Resolve other into a Spark DataFrame
         if isinstance(other, GIS) and col == "NISE":
@@ -66,40 +64,19 @@ class GIS(ABC):
         if table_b is None:
             raise ValueError("Other object does not have a Spark DataFrame loaded.")
 
-        # Force comparison on string representation to avoid CAST errors
-        a_keys = (
-            table_a
-            .select(F.col(col).cast("string").alias(col))
-            .distinct()
-            .withColumnRenamed(col, f"a_{col}")
-        )
-        b_keys = (
-            table_b
-            .select(F.col(col).cast("string").alias(col))
-            .distinct()
-            .withColumnRenamed(col, f"b_{col}")
+        # Distinct keys
+        a_keys = table_a.select(col).distinct().alias("a")
+        b_keys = table_b.select(col).distinct().alias("b")
+
+        # Full outer join to detect existence differences
+        diff = (
+            a_keys.join(b_keys, on=[col], how="outer")
         )
 
-        # Full outer join on string key
-        diff = a_keys.join(
-            b_keys,
-            on=a_keys[f"a_{col}"] == b_keys[f"b_{col}"],
-            how="outer"
-        )
-
-        # Present only in A: b side is null
-        in_a_not_b = (
-            diff
-            .filter(F.col(f"b_{col}").isNull())
-            .select(F.col(f"a_{col}").alias(col))
-        )
-
-        # Present only in B: a side is null
-        in_b_not_a = (
-            diff
-            .filter(F.col(f"a_{col}").isNull())
-            .select(F.col(f"b_{col}").alias(col))
-        )
+        # In A not B: B side is null
+        in_a_not_b = diff.filter(F.col(f"b.{col}").isNull()).select(F.col(f"a.{col}").alias(col))
+        # In B not A: A side is null
+        in_b_not_a = diff.filter(F.col(f"a.{col}").isNull()).select(F.col(f"b.{col}").alias(col))
 
         return in_a_not_b, in_b_not_a
 
@@ -137,7 +114,7 @@ class AMI(ABC):
         table_a = self.sdf
 
         if table_a is None:
-            raise ValueError("self.sdf is None. Load data first.")
+            raise ValueError("self.sdf is None. Load AMI data first.")
 
         # Resolve other into a Spark DataFrame
         if isinstance(other, GIS) and col == "NISE":
@@ -154,40 +131,15 @@ class AMI(ABC):
         if table_b is None:
             raise ValueError("Other object does not have a Spark DataFrame loaded.")
 
-        # Force comparison on string representation to avoid CAST errors
-        a_keys = (
-            table_a
-            .select(F.col(col).cast("string").alias(col))
-            .distinct()
-            .withColumnRenamed(col, f"a_{col}")
-        )
-        b_keys = (
-            table_b
-            .select(F.col(col).cast("string").alias(col))
-            .distinct()
-            .withColumnRenamed(col, f"b_{col}")
+        a_keys = table_a.select(col).distinct().alias("a")
+        b_keys = table_b.select(col).distinct().alias("b")
+
+        diff = (
+            a_keys.join(b_keys, on=[col], how="outer")
         )
 
-        # Full outer join on string key
-        diff = a_keys.join(
-            b_keys,
-            on=a_keys[f"a_{col}"] == b_keys[f"b_{col}"],
-            how="outer"
-        )
-
-        # Present only in A: b side is null
-        in_a_not_b = (
-            diff
-            .filter(F.col(f"b_{col}").isNull())
-            .select(F.col(f"a_{col}").alias(col))
-        )
-
-        # Present only in B: a side is null
-        in_b_not_a = (
-            diff
-            .filter(F.col(f"a_{col}").isNull())
-            .select(F.col(f"b_{col}").alias(col))
-        )
+        in_a_not_b = diff.filter(F.col(f"b.{col}").isNull()).select(F.col(f"a.{col}").alias(col))
+        in_b_not_a = diff.filter(F.col(f"a.{col}").isNull()).select(F.col(f"b.{col}").alias(col))
 
         return in_a_not_b, in_b_not_a
 
@@ -261,27 +213,63 @@ class ConsumptionData(AMI):
         self.set_energy_df()
 
     def set_sdf(self, sdf: DataFrame) -> DataFrame:
-        """Equivalent to set_df, but using Spark operations."""
+        """Process datatype and add hour column, robust to malformed values."""
+
         sdf = (
             sdf
-            .withColumn("CONTADOR", F.lower(F.col("CONTADOR")))
-            .withColumn("NISE", F.col("LOCALIZACION").cast("long"))
-            .drop("LOCALIZACION")
-            .withColumn("VALOR_LECTURA", F.col("VALOR_LECTURA").cast("double"))
-            .withColumn("MEDIDOR", F.col("MEDIDOR").cast("long"))
-            .withColumn("LOCALIZACION_REAL", F.col("LOCALIZACION_REAL").cast("long"))
+            # CONTADOR as lowercase string, safe even if not originally string
+            .withColumn("CONTADOR", F.lower(F.col("CONTADOR").cast("string")))
+
+            # LOCALIZACION → NISE, using try_cast semantics:
+            #   numeric-like → bigint
+            #   malformed (e.g. 'PLANTA BRA') → NULL, no error
+            .withColumn(
+                "LOCALIZACION_STR",
+                F.trim(F.col("LOCALIZACION").cast("string"))
+            )
+            .withColumn(
+                "LOCALIZACION_CLEAN",
+                F.regexp_replace("LOCALIZACION_STR", r"^(\d+),0+$", r"$1")
+            )
+            .withColumn(
+                "NISE",
+                F.expr("try_cast(LOCALIZACION_CLEAN as bigint)")
+            )
+            .drop("LOCALIZACION", "LOCALIZACION_STR", "LOCALIZACION_CLEAN")
+
+            # VALOR_LECTURA as double with try_cast behavior
+            .withColumn(
+                "VALOR_LECTURA",
+                F.expr("try_cast(VALOR_LECTURA as double)")
+            )
+
+            # MEDIDOR as bigint with try_cast
+            .withColumn(
+                "MEDIDOR",
+                F.expr("try_cast(MEDIDOR as bigint)")
+            )
+
+            # LOCALIZACION_REAL as bigint with try_cast
+            .withColumn(
+                "LOCALIZACION_REAL",
+                F.expr("try_cast(LOCALIZACION_REAL as bigint)")
+            )
+
+            # FECHA_LECTURA from FECHA_LECTURA_REAL (assuming already timestamp)
             .withColumn("FECHA_LECTURA", F.col("FECHA_LECTURA_REAL"))
         )
 
-        # Compute Hour as decimal hours from timestamp
+        # Compute Hour as decimal hours from timestamp.
+        # If FECHA_LECTURA is NULL, hour/minute/second return NULL -> Hour is NULL.
         sdf = sdf.withColumn(
             "Hour",
             (
-                F.hour("FECHA_LECTURA") * 3600.0 +
-                F.minute("FECHA_LECTURA") * 60.0 +
+                F.hour("FECHA_LECTURA") * F.lit(3600.0) +
+                F.minute("FECHA_LECTURA") * F.lit(60.0) +
                 F.second("FECHA_LECTURA")
-            ) / 3600.0
+            ) / F.lit(3600.0)
         )
+
         return sdf
 
     def split_ene_mde(self, sdf: DataFrame) -> Tuple[DataFrame, DataFrame]:
@@ -407,14 +395,45 @@ class VoltageData(AMI):
         self.set_voltage_df()
 
     def set_sdf(self, sdf: DataFrame) -> DataFrame:
+        """Process datatype, robust to malformed values."""
         sdf = (
             sdf
-            .withColumn("NISE", F.col("LOCALIZACION").cast("long"))
-            .drop("LOCALIZACION")
-            .withColumn("VALOR_LECTURA", F.col("VALOR_LECTURA").cast("double"))
-            .withColumn("MEDIDOR", F.col("MEDIDOR").cast("long"))
+            # NISE from LOCALIZACION with try_cast
+            .withColumn(
+                "LOCALIZACION_STR",
+                F.trim(F.col("LOCALIZACION").cast("string"))
+            )
+            .withColumn(
+                "LOCALIZACION_CLEAN",
+                F.regexp_replace("LOCALIZACION_STR", r"^(\d+),0+$", r"$1")
+            )
+            .withColumn(
+                "NISE",
+                F.expr("try_cast(LOCALIZACION_CLEAN as bigint)")
+            )
+            .drop("LOCALIZACION", "LOCALIZACION_STR", "LOCALIZACION_CLEAN")
+
+            # VALOR_LECTURA as double
+            .withColumn(
+                "VALOR_LECTURA",
+                F.expr("try_cast(VALOR_LECTURA as double)")
+            )
+
+            # MEDIDOR as bigint
+            .withColumn(
+                "MEDIDOR",
+                F.expr("try_cast(MEDIDOR as bigint)")
+            )
+
+            # FECHA_LECTURA from FECHA_LECTURA_REAL
             .withColumn("FECHA_LECTURA", F.col("FECHA_LECTURA_REAL"))
+
+            # UNIDAD normalized to string
+            .withColumn("UNIDAD", F.col("UNIDAD").cast("string"))
+
+            # Filter by selected phase values
             .filter(F.col("UNIDAD").isin(self.phase_vals))
+
             .orderBy("MEDIDOR", "FECHA_LECTURA")
         )
         return sdf
@@ -473,14 +492,45 @@ class PowerData(AMI):
         self.set_reactive_df()
 
     def set_sdf(self, sdf: DataFrame) -> DataFrame:
+        """Process datatype, robust to malformed values."""
         sdf = (
             sdf
-            .withColumn("NISE", F.col("LOCALIZACION").cast("long"))
-            .drop("LOCALIZACION")
-            .withColumn("VALOR_LECTURA", F.col("VALOR_LECTURA").cast("double"))
-            .withColumn("MEDIDOR", F.col("MEDIDOR").cast("long"))
-            .withColumn("LOCALIZACION_REAL", F.col("LOCALIZACION_REAL").cast("long"))
+            # NISE from LOCALIZACION
+            .withColumn(
+                "LOCALIZACION_STR",
+                F.trim(F.col("LOCALIZACION").cast("string"))
+            )
+            .withColumn(
+                "LOCALIZACION_CLEAN",
+                F.regexp_replace("LOCALIZACION_STR", r"^(\d+),0+$", r"$1")
+            )
+            .withColumn(
+                "NISE",
+                F.expr("try_cast(LOCALIZACION_CLEAN as bigint)")
+            )
+            .drop("LOCALIZACION", "LOCALIZACION_STR", "LOCALIZACION_CLEAN")
+
+            # VALOR_LECTURA as double
+            .withColumn(
+                "VALOR_LECTURA",
+                F.expr("try_cast(VALOR_LECTURA as double)")
+            )
+
+            # MEDIDOR as bigint
+            .withColumn(
+                "MEDIDOR",
+                F.expr("try_cast(MEDIDOR as bigint)")
+            )
+
+            # LOCALIZACION_REAL as bigint
+            .withColumn(
+                "LOCALIZACION_REAL",
+                F.expr("try_cast(LOCALIZACION_REAL as bigint)")
+            )
+
+            # FECHA_LECTURA from FECHA_LECTURA_REAL
             .withColumn("FECHA_LECTURA", F.col("FECHA_LECTURA_REAL"))
+
             .orderBy("MEDIDOR", "FECHA_LECTURA")
         )
         return sdf
