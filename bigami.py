@@ -36,18 +36,20 @@ class GIS(ABC):
         other: object,
         domain_label: str = "NodeID"
     ) -> Tuple[DataFrame, DataFrame]:
-        """Compare identifiers between this GIS and another object.
+        """Compare identifiers between this dataset and another object.
 
         Returns:
-        - in_a_not_b: ids present only in this sdf
-        - in_b_not_a: ids present only in other's df/sdf
+        in_a_not_b: ids present only in this sdf
+        in_b_not_a: ids present only in other's df/sdf
 
+        Comparison is done on a normalized string representation of `domain_label`
+        to avoid type conflicts and implicit casts.
         """
         col = domain_label
         table_a = self.sdf
 
         if table_a is None:
-            raise ValueError("self.sdf is None. Load GIS data first.")
+            raise ValueError("self.sdf is None. Load data first.")
 
         # Resolve other into a Spark DataFrame
         if isinstance(other, GIS) and col == "NISE":
@@ -64,19 +66,45 @@ class GIS(ABC):
         if table_b is None:
             raise ValueError("Other object does not have a Spark DataFrame loaded.")
 
-        # Distinct keys
-        a_keys = table_a.select(col).distinct().alias("a")
-        b_keys = table_b.select(col).distinct().alias("b")
+        # Normalize domain column to STRING on both sides to avoid implicit casts
+        norm_col = "__key"
 
-        # Full outer join to detect existence differences
-        diff = (
-            a_keys.join(b_keys, on=[col], how="outer")
+        a_keys = (
+            table_a
+            .select(F.col(col).cast("string").alias(col))
+            .distinct()
+            .withColumn(norm_col, F.col(col))
         )
 
-        # In A not B: B side is null
-        in_a_not_b = diff.filter(F.col(f"b.{col}").isNull()).select(F.col(f"a.{col}").alias(col))
-        # In B not A: A side is null
-        in_b_not_a = diff.filter(F.col(f"a.{col}").isNull()).select(F.col(f"b.{col}").alias(col))
+        b_keys = (
+            table_b
+            .select(F.col(col).cast("string").alias(col))
+            .distinct()
+            .withColumn(norm_col, F.col(col))
+        )
+
+        diff = (
+            a_keys.alias("a")
+            .join(
+                b_keys.alias("b"),
+                on=[F.col(f"a.{norm_col}") == F.col(f"b.{norm_col}")],
+                how="outer"
+            )
+        )
+
+        # Present only in A: exists in A, missing in B
+        in_a_not_b = (
+            diff
+            .filter(F.col(f"a.{norm_col}").isNotNull() & F.col(f"b.{norm_col}").isNull())
+            .select(F.col(f"a.{col}").alias(col))
+        )
+
+        # Present only in B: exists in B, missing in A
+        in_b_not_a = (
+            diff
+            .filter(F.col(f"b.{norm_col}").isNotNull() & F.col(f"a.{norm_col}").isNull())
+            .select(F.col(f"b.{col}").alias(col))
+        )
 
         return in_a_not_b, in_b_not_a
 
@@ -89,6 +117,10 @@ class AMI(ABC):
     """Abstract AMI device backed by Spark DataFrames."""
 
     sdf: Optional[DataFrame] = None  # main Spark DataFrame
+    # Optional generic time filtering
+    from_ts: Optional[str] = None     # e.g., "YYYY-MM-DD"
+    to_ts: Optional[str] = None       # e.g., "YYYY-MM-DD"
+    ts_col: str = "FECHA_LECTURA_REAL"  # default raw timestamp column name
 
     @abstractmethod
     def load_data(self):
@@ -99,6 +131,23 @@ class AMI(ABC):
     def set_sdf(self, sdf: DataFrame) -> DataFrame:
         """Process datatype and columns names on a Spark DataFrame."""
         ...
+
+    def _apply_time_filter(self, sdf: DataFrame) -> DataFrame:
+        """Apply [from_ts, to_ts) filter if provided.
+
+        - This is called *before* set_sdf so you scan fewer rows.
+        - Assumes ts_col is present in the raw table.
+
+        """
+        if self.from_ts is None and self.to_ts is None:
+            return sdf
+
+        cond = F.lit(True)
+        if self.from_ts is not None:
+            cond = cond & (F.col(self.ts_col) >= F.lit(self.from_ts))
+        if self.to_ts is not None:
+            cond = cond & (F.col(self.ts_col) < F.lit(self.to_ts))
+        return sdf.filter(cond)
 
     def test_domain(
         self,
@@ -114,7 +163,7 @@ class AMI(ABC):
         table_a = self.sdf
 
         if table_a is None:
-            raise ValueError("self.sdf is None. Load AMI data first.")
+            raise ValueError("self.sdf is None. Load data first.")
 
         # Resolve other into a Spark DataFrame
         if isinstance(other, GIS) and col == "NISE":
@@ -131,15 +180,45 @@ class AMI(ABC):
         if table_b is None:
             raise ValueError("Other object does not have a Spark DataFrame loaded.")
 
-        a_keys = table_a.select(col).distinct().alias("a")
-        b_keys = table_b.select(col).distinct().alias("b")
+        # Normalize domain column to STRING on both sides to avoid implicit casts
+        norm_col = "__key"
 
-        diff = (
-            a_keys.join(b_keys, on=[col], how="outer")
+        a_keys = (
+            table_a
+            .select(F.col(col).cast("string").alias(col))
+            .distinct()
+            .withColumn(norm_col, F.col(col))
         )
 
-        in_a_not_b = diff.filter(F.col(f"b.{col}").isNull()).select(F.col(f"a.{col}").alias(col))
-        in_b_not_a = diff.filter(F.col(f"a.{col}").isNull()).select(F.col(f"b.{col}").alias(col))
+        b_keys = (
+            table_b
+            .select(F.col(col).cast("string").alias(col))
+            .distinct()
+            .withColumn(norm_col, F.col(col))
+        )
+
+        diff = (
+            a_keys.alias("a")
+            .join(
+                b_keys.alias("b"),
+                on=[F.col(f"a.{norm_col}") == F.col(f"b.{norm_col}")],
+                how="outer"
+            )
+        )
+
+        # Present only in A: exists in A, missing in B
+        in_a_not_b = (
+            diff
+            .filter(F.col(f"a.{norm_col}").isNotNull() & F.col(f"b.{norm_col}").isNull())
+            .select(F.col(f"a.{col}").alias(col))
+        )
+
+        # Present only in B: exists in B, missing in A
+        in_b_not_a = (
+            diff
+            .filter(F.col(f"b.{norm_col}").isNotNull() & F.col(f"a.{norm_col}").isNull())
+            .select(F.col(f"b.{col}").alias(col))
+        )
 
         return in_a_not_b, in_b_not_a
 
@@ -199,7 +278,10 @@ class ConsumptionData(AMI):
     table_name: Optional[str] = "ami.consumption"  # Spark table (Delta)
     data_path: Optional[str] = None                # alternative: path
     gis: Optional[GIS] = None
-
+    # Optional date filters (inherited from AMI, but override defaults)
+    from_ts: Optional[str] = "2026-02-28"
+    to_ts: Optional[str] = "2026-03-13"
+    ts_col: str = "FECHA_LECTURA_REAL"
     ene_data: Optional[DataFrame] = None
     mde_data: Optional[DataFrame] = None
     power_data: Optional[DataFrame] = None
@@ -298,7 +380,7 @@ class ConsumptionData(AMI):
         return abc_df.filter(F.col("TIPO_CONSUMO").isin("Power Factor", "Power Factor Angle"))
 
     def load_data(self):
-        """Read and set raw daily dirty data using Spark."""
+        """Read and set raw daily dirty data using Spark, with optional time filtering."""
         if self.table_name:
             sdf = spark.table(self.table_name)
         elif self.data_path:
@@ -306,6 +388,10 @@ class ConsumptionData(AMI):
         else:
             raise ValueError("Either table_name or data_path must be provided.")
 
+        # Apply date filter as early as possible (still raw schema)
+        sdf = self._apply_time_filter(sdf)
+
+        # Then apply all type cleaning / derived columns
         sdf = self.set_sdf(sdf)
         self.sdf = sdf
 
@@ -386,7 +472,10 @@ class VoltageData(AMI):
     table_name: Optional[str] = "ami.voltages"
     data_path: Optional[str] = None
     phase_vals: list = field(default_factory=lambda: ["Phase A Average RMS Voltage"])
-
+    # Optional date filters (inherited from AMI, but override defaults)
+    from_ts: Optional[str] = "2026-02-28"
+    to_ts: Optional[str] = "2026-03-13"
+    ts_col: str = "FECHA_LECTURA_REAL"
     voltage_data: Optional[DataFrame] = None
     voltage_df: Optional[DataFrame] = None
 
@@ -446,6 +535,7 @@ class VoltageData(AMI):
         else:
             raise ValueError("Either table_name or data_path must be provided.")
 
+        sdf = self._apply_time_filter(sdf)  # <── added
         sdf = self.set_sdf(sdf)
         self.sdf = sdf
 
@@ -480,7 +570,10 @@ class VoltageData(AMI):
 class PowerData(AMI):
     table_name: Optional[str] = "ami.power"
     data_path: Optional[str] = None
-
+    # Optional date filters (inherited from AMI, but override defaults)
+    from_ts: Optional[str] = "2026-02-28"
+    to_ts: Optional[str] = "2026-03-13"
+    ts_col: str = "FECHA_LECTURA_REAL"
     kwh_data: Optional[DataFrame] = None
     kvarh_data: Optional[DataFrame] = None
     active_df: Optional[DataFrame] = None
@@ -549,6 +642,7 @@ class PowerData(AMI):
         else:
             raise ValueError("Either table_name or data_path must be provided.")
 
+        sdf = self._apply_time_filter(sdf)  # <── added
         sdf = self.set_sdf(sdf)
         self.sdf = sdf
 
