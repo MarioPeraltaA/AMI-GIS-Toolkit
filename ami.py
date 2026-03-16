@@ -57,6 +57,15 @@ class GIS(ABC):
         | right_only | Table B - only identifiers    |
         +------------+-------------------------------+
 
+        Returns
+        -------
+        in_both : pd.Series
+            Identifiers present in both tables.
+        in_a_not_b : pd.Series
+            Identifiers present only in self.df.
+        in_b_not_a : pd.Series
+            Identifiers present only in other.
+
         .. warning::
 
             Make sure domain field is label the same
@@ -64,32 +73,35 @@ class GIS(ABC):
 
         """
         col = domain_label
-        table_a = self.gdf
+        table_a = self.df
+
         if isinstance(other, GIS) and col == "NISE":
             table_b = other.gdf.copy(deep=True)
-            table_b.rename(
-                columns={"OBJECTID": domain_label},
-                inplace=True
-            )
+            table_b.rename(columns={"OBJECTID": domain_label}, inplace=True)
         elif isinstance(other, AMI):
             table_b = other.df.copy(deep=True)
         elif isinstance(other, pd.DataFrame):
             table_b = other.copy(deep=True)
         elif isinstance(other, InfoClientManager):
             table_b = other.df.copy(deep=True)
+        else:
+            raise TypeError(f"Unsupported type for 'other': {type(other)}")
 
         table_a_keys = table_a[[col]].drop_duplicates()
         table_b_keys = table_b[[col]].drop_duplicates()
-        diff = (
-            table_a_keys
-            .merge(table_b_keys, on=col, how='outer', indicator=True)
+
+        diff = table_a_keys.merge(
+            table_b_keys,
+            on=col,
+            how='outer',
+            indicator=True
         )
+
+        in_both = diff.loc[diff['_merge'] == 'both', col]
         in_a_not_b = diff.loc[diff['_merge'] == 'left_only', col]
         in_b_not_a = diff.loc[diff['_merge'] == 'right_only', col]
-        return (
-            in_a_not_b,
-            in_b_not_a
-        )
+
+        return in_both, in_a_not_b, in_b_not_a
 
 
 @dataclass
@@ -133,6 +145,15 @@ class AMI(ABC):
         | right_only | Table B - only identifiers    |
         +------------+-------------------------------+
 
+        Returns
+        -------
+        in_both : pd.Series
+            Identifiers present in both tables.
+        in_a_not_b : pd.Series
+            Identifiers present only in self.df.
+        in_b_not_a : pd.Series
+            Identifiers present only in other.
+
         .. warning::
 
             Make sure domain field is label the same
@@ -141,62 +162,131 @@ class AMI(ABC):
         """
         col = domain_label
         table_a = self.df
+
         if isinstance(other, GIS) and col == "NISE":
-            # table_b = other.layers['Loads'][0]
             table_b = other.gdf.copy(deep=True)
-            table_b.rename(
-                columns={"OBJECTID": domain_label},
-                inplace=True
-            )
+            table_b.rename(columns={"OBJECTID": domain_label}, inplace=True)
         elif isinstance(other, AMI):
             table_b = other.df.copy(deep=True)
         elif isinstance(other, pd.DataFrame):
             table_b = other.copy(deep=True)
         elif isinstance(other, InfoClientManager):
             table_b = other.df.copy(deep=True)
+        else:
+            raise TypeError(f"Unsupported type for 'other': {type(other)}")
 
         table_a_keys = table_a[[col]].drop_duplicates()
         table_b_keys = table_b[[col]].drop_duplicates()
-        diff = (
-            table_a_keys
-            .merge(table_b_keys, on=col, how='outer', indicator=True)
+
+        diff = table_a_keys.merge(
+            table_b_keys,
+            on=col,
+            how='outer',
+            indicator=True
         )
+
+        in_both = diff.loc[diff['_merge'] == 'both', col]
         in_a_not_b = diff.loc[diff['_merge'] == 'left_only', col]
         in_b_not_a = diff.loc[diff['_merge'] == 'right_only', col]
-        return (
-            in_a_not_b,
-            in_b_not_a
-        )
+
+        return in_both, in_a_not_b, in_b_not_a
 
 
 @dataclass
 class InfoClientManager(ABC):
-    """Database of some utility's costumers."""
+    """Database of some utility's customers.
+
+    The customer master data so to speak. It is meant
+    to be static but updated.
+
+    """
 
     df: pd.DataFrame | None = None
 
     @abstractmethod
-    def read_costumers_data(
+    def read_customers_data(
         self
     ):
-        """Load information data of utility's costumers."""
+        """Load information data of utility's customers."""
         ...
+
+    def reconcile_entities(
+            self,
+            other: AMI,
+            entity_keys: pd.Series,
+            entity_label: str = "NISE",
+            self_attr: str = "DESCSECTOR",
+            other_attr: str = "TIPO_SECTOR",
+            date_col: str = "FECHA_LECTURA"
+
+    ) -> pd.DataFrame | None:
+        """Compare whether entity attributes agree across two data sources.
+
+        Verify and flag whether two systems report
+        the same information about the same entity.
+
+        .. Note::
+
+            If the ``other`` object it is a time series
+            the latest value is assumed to be the valid one.
+
+        .. Warning::
+
+            This works better if attributes to compare
+            to each other are categorical.
+
+        .. Warning::
+
+            Make sure data type of entity keys is
+            consistent with the structures under
+            comparison.
+
+        """
+        self_df = self.df
+        if not isinstance(other, AMI):
+            raise TypeError(f"'other' must be AMI, got {type(other)}")
+
+        other_df = other.df
+        ts_customers = (
+            other_df[other_df[entity_label].isin(entity_keys)]
+        )
+        # Retain most recent value
+        ami_keys = (
+            ts_customers.loc[
+                ts_customers.groupby(entity_label)[date_col].idxmax()
+            ]
+            .set_index(entity_label)[other_attr]
+        )
+
+        utility_keys = (
+            self_df[self_df[entity_label].isin(entity_keys)]
+            .set_index(entity_label)[self_attr]
+        )
+        cross_source_df = (
+            utility_keys.to_frame("self_source")
+            .join(ami_keys.rename("other_source"), how="inner")
+        )
+        cross_source_df['match'] = (
+            cross_source_df["self_source"].astype("string")
+            == cross_source_df["other_source"].astype("string")
+        )
+        return cross_source_df
 
 
 @dataclass
-class CNFLCostumers(InfoClientManager):
+class CNFLCustomers(InfoClientManager):
     """Database of CNFL utility."""
 
-    database_path: str = "./Data/Costumers/Infoclientes.txt"
-    datatype_path: str = "./Data/Costumers/datatype.json"
+    database_path: str = "./Data/Customers/Infoclientes.txt"
+    datatype_path: str = "./Data/Customers/datatype.json"
     columns_dtype: dict = field(init=False)
     df: pd.DataFrame = field(init=False)
 
     def __post_init__(
             self
     ):
-        """Instantiate company's costumers database."""
-        self.df = self.read_costumers_data()
+        """Instantiate company's customers database."""
+        self.df = self.read_customers_data()
 
     def set_columns_data_type(
             self,
@@ -219,7 +309,7 @@ class CNFLCostumers(InfoClientManager):
             self,
             info_df: pd.DataFrame
     ):
-        """Clean up and normalize costumers dataset."""
+        """Clean up and normalize customers dataset."""
         date_cols: list[str] = [
             "FEC_INST_NISE",
             "FECHA_LECTURA",
@@ -243,7 +333,7 @@ class CNFLCostumers(InfoClientManager):
         )
         return info_df
 
-    def read_costumers_data(
+    def read_customers_data(
             self
     ) -> pd.DataFrame:
         """Load and process CNFL's Infoclientes file."""
@@ -266,7 +356,7 @@ class GISCircuit(GIS):
         default_factory=dict
     )
     per_slice: int | None = None
-    costumers_layer_name: str = "Loads"
+    customers_layer_name: str = "Loads"
 
     def __post_init__(
             self
@@ -274,7 +364,7 @@ class GISCircuit(GIS):
         """Initialize GIS data structure."""
         self.load_gis()
         self.paint_layers()
-        self.gdf = self.layers[self.costumers_layer_name][0]
+        self.gdf = self.layers[self.customers_layer_name][0]
         self.gdf.rename(
             columns={"OBJECTID": "NISE"}, inplace=True
         )
@@ -650,9 +740,9 @@ class ConsumptionData(AMI):
             kwh_df.groupby("MEDIDOR")["FECHA_LECTURA"].diff()
         )
         # Set approx. "daily" sent and gotten
-        costumers = kwh_df.groupby("MEDIDOR")
-        kwh_df['Daily Sent'] = costumers['Delivered'].diff()
-        kwh_df['Daily Gotten'] = costumers['Received'].diff()
+        customers = kwh_df.groupby("MEDIDOR")
+        kwh_df['Daily Sent'] = customers['Delivered'].diff()
+        kwh_df['Daily Gotten'] = customers['Received'].diff()
 
         self.energy_df = kwh_df
 
@@ -677,16 +767,16 @@ class ConsumptionData(AMI):
         As long as ami device location is not None
         and such location exists in GIS data.
 
-        .. note::
+        .. Note::
 
             Drop duplicates between ``MEDIDOR`` and ``NISE``
             so that it is force to map one meter to one
-            costumer NISE although one costumer may have
+            customer NISE although one customer may have
             multiple meters, this is only for visualization
             purposes.
 
         """
-        gdf = self.gis.layers['Loads'][0]   # Retrieve costumers location
+        gdf = self.gis.layers['Loads'][0]   # Retrieve customers location
         # to_geom = dict(zip(gdf['IDLOCALIZA'], gdf['geometry']))
         to_geom = dict(zip(gdf[geo_of_col], gdf['geometry']))
         # ami_df = (
@@ -969,7 +1059,7 @@ class PowerData(AMI):
         receives power but in case they don't then it
         is either zero or filled up with `NaN`.
 
-        .. note::
+        .. Note::
 
             Columns are labeled from load's perspective.
 

@@ -39,11 +39,13 @@ class GIS(ABC):
         """Compare identifiers between this dataset and another object.
 
         Returns:
-        in_a_not_b: ids present only in this sdf
-        in_b_not_a: ids present only in other's df/sdf
+            in_both: ids present in both datasets
+            in_a_not_b: ids present only in this sdf
+            in_b_not_a: ids present only in other's sdf/df
 
         Comparison is done on a normalized string representation of `domain_label`
         to avoid type conflicts and implicit casts.
+
         """
         col = domain_label
         table_a = self.sdf
@@ -66,7 +68,6 @@ class GIS(ABC):
         if table_b is None:
             raise ValueError("Other object does not have a Spark DataFrame loaded.")
 
-        # Normalize domain column to STRING on both sides to avoid implicit casts
         norm_col = "__key"
 
         a_keys = (
@@ -92,21 +93,28 @@ class GIS(ABC):
             )
         )
 
-        # Present only in A: exists in A, missing in B
+        # Present in both
+        in_both = (
+            diff
+            .filter(F.col(f"a.{norm_col}").isNotNull() & F.col(f"b.{norm_col}").isNotNull())
+            .select(F.col(f"a.{col}").alias(col))
+        )
+
+        # Present only in A
         in_a_not_b = (
             diff
             .filter(F.col(f"a.{norm_col}").isNotNull() & F.col(f"b.{norm_col}").isNull())
             .select(F.col(f"a.{col}").alias(col))
         )
 
-        # Present only in B: exists in B, missing in A
+        # Present only in B
         in_b_not_a = (
             diff
             .filter(F.col(f"b.{norm_col}").isNotNull() & F.col(f"a.{norm_col}").isNull())
             .select(F.col(f"b.{col}").alias(col))
         )
 
-        return in_a_not_b, in_b_not_a
+        return in_both, in_a_not_b, in_b_not_a
 
 # AMI base in Spark
 # -----------------
@@ -121,6 +129,11 @@ class AMI(ABC):
     from_ts: Optional[str] = None     # e.g., "YYYY-MM-DD"
     to_ts: Optional[str] = None       # e.g., "YYYY-MM-DD"
     ts_col: str = "FECHA_LECTURA_REAL"  # default raw timestamp column name
+    # Stores Spark DataFrames with invalid raw values by audit key
+    audit_invalid_values: bool = False
+    invalid_value_audit: dict[str, DataFrame] = field(
+        default_factory=dict, init=False
+    )
 
     @abstractmethod
     def load_data(self):
@@ -156,7 +169,10 @@ class AMI(ABC):
     ) -> Tuple[DataFrame, DataFrame]:
         """Compare identifiers between this AMI dataset and another object.
 
-        Same semantics as GIS.test_domain, but for AMI.sdf.
+        Returns:
+            in_both: ids present in both datasets
+            in_a_not_b: ids present only in this sdf
+            in_b_not_a: ids present only in other's sdf/df
 
         """
         col = domain_label
@@ -180,7 +196,6 @@ class AMI(ABC):
         if table_b is None:
             raise ValueError("Other object does not have a Spark DataFrame loaded.")
 
-        # Normalize domain column to STRING on both sides to avoid implicit casts
         norm_col = "__key"
 
         a_keys = (
@@ -206,23 +221,102 @@ class AMI(ABC):
             )
         )
 
-        # Present only in A: exists in A, missing in B
+        # Present in both
+        in_both = (
+            diff
+            .filter(F.col(f"a.{norm_col}").isNotNull() & F.col(f"b.{norm_col}").isNotNull())
+            .select(F.col(f"a.{col}").alias(col))
+        )
+
+        # Present only in A
         in_a_not_b = (
             diff
             .filter(F.col(f"a.{norm_col}").isNotNull() & F.col(f"b.{norm_col}").isNull())
             .select(F.col(f"a.{col}").alias(col))
         )
 
-        # Present only in B: exists in B, missing in A
+        # Present only in B
         in_b_not_a = (
             diff
             .filter(F.col(f"b.{norm_col}").isNotNull() & F.col(f"a.{norm_col}").isNull())
             .select(F.col(f"b.{col}").alias(col))
         )
 
-        return in_a_not_b, in_b_not_a
+        return in_both, in_a_not_b, in_b_not_a
 
-# InfoClientManager base and CNFLCostumers in Spark
+    def audit_odd_values(
+        self,
+        sdf: DataFrame,
+        col_name: str,
+        valid_match_regex: str = r"^[+-]?\d+$",
+        audit_key: Optional[str] = None
+    ) -> DataFrame:
+        """Identify and quantify values that do not follow a regex.
+
+        Build a Spark DataFrame with raw
+        values from ``col_name`` that do NOT match a bigint pattern.
+
+        Valid bigint pattern:
+            optional leading sign (+/-), followed by one or more digits
+
+        Examples considered valid:
+            123
+            -45
+            +77
+            00012
+
+        Examples considered invalid:
+            N/A
+            X0X07H16
+            12.3
+            1,000
+            45A
+
+        Parameters
+        ----------
+        sdf : DataFrame
+            Input Spark DataFrame.
+        col_name : str
+            Column to validate/cast.
+        valid_match_regex : str
+            Regex pattern to match. Default is for integer-like
+            values suitable for later bigint cast
+            optional sign, then digits only.
+        audit_key : str
+            Column to be interrogated.
+
+        Returns
+        -------
+        invalid_df : DataFrame
+            Spark DataFrame with columns:
+                - invalid_raw_value
+                - invalid_count
+                - column_name
+
+        Also stores the DataFrame in:
+            self.invalid_value_audit[audit_key or col_name]
+
+        """
+
+        audit_key = audit_key or col_name
+        raw_as_str = F.col(col_name).cast("string")
+        invalid_cond = ~raw_as_str.rlike(valid_match_regex)
+
+        invalid_df = (
+            sdf
+            .select(raw_as_str.alias("invalid_raw_value"))
+            .filter(invalid_cond)
+            .groupBy("invalid_raw_value")
+            .agg(F.count(F.lit(1)).alias("invalid_count"))
+            .withColumn("column_name", F.lit(col_name))
+            .select("column_name", "invalid_raw_value", "invalid_count")
+            # .orderBy(F.desc("invalid_count"), F.asc("invalid_raw_value"))
+        )
+
+        self.invalid_value_audit[audit_key] = invalid_df
+        return invalid_df
+
+# InfoClientManager base and CNFLCustomers in Spark
 # -------------------------------------------------
 
 @dataclass
@@ -237,7 +331,7 @@ class InfoClientManager(ABC):
 
 
 @dataclass
-class CNFLCostumers(InfoClientManager):
+class CNFLCustomers(InfoClientManager):
     """CNFL customers database migrated to Spark.
 
     Assumes a Delta or parquet table exists; if you still have a text file
@@ -296,6 +390,15 @@ class ConsumptionData(AMI):
 
     def set_sdf(self, sdf: DataFrame) -> DataFrame:
         """Process datatype and add hour column, robust to malformed values."""
+        if self.audit_invalid_values:
+            # Audit bad raw values first, without casting
+            _ = self.audit_odd_values(
+                sdf,
+                "LOCALIZACION",
+                audit_key="NISE" # This field it is actually the NISE
+            )
+            _ = self.audit_odd_values(sdf, "MEDIDOR")
+            _ = self.audit_odd_values(sdf, "LOCALIZACION_REAL")
 
         sdf = (
             sdf
@@ -485,6 +588,16 @@ class VoltageData(AMI):
 
     def set_sdf(self, sdf: DataFrame) -> DataFrame:
         """Process datatype, robust to malformed values."""
+        if self.audit_invalid_values:
+            # Audit bad raw values first, without casting
+            _ = self.audit_odd_values(
+                sdf,
+                "LOCALIZACION",
+                audit_key="NISE" # This field it is actually the NISE
+            )
+            _ = self.audit_odd_values(sdf, "MEDIDOR")
+            _ = self.audit_odd_values(sdf, "LOCALIZACION_REAL")
+
         sdf = (
             sdf
             # NISE from LOCALIZACION with try_cast
@@ -586,6 +699,16 @@ class PowerData(AMI):
 
     def set_sdf(self, sdf: DataFrame) -> DataFrame:
         """Process datatype, robust to malformed values."""
+        if self.audit_invalid_values:
+            # Audit bad raw values first, without casting
+            _ = self.audit_odd_values(
+                sdf,
+                "LOCALIZACION",
+                audit_key="NISE" # This field it is actually the NISE
+            )
+            _ = self.audit_odd_values(sdf, "MEDIDOR")
+            _ = self.audit_odd_values(sdf, "LOCALIZACION_REAL")
+
         sdf = (
             sdf
             # NISE from LOCALIZACION
