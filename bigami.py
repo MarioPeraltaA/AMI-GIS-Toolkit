@@ -11,12 +11,152 @@ import json
 
 spark = SparkSession.getActiveSession()  # in a Databricks notebook / job
 
+
+class DomainComparable():
+    """Shared domain comparison utilities for Spark-backed classes."""
+
+    sdf: Optional[DataFrame] = None
+
+    def _resolve_other_sdf(self, other: object, domain_label: str) -> DataFrame:
+        if isinstance(other, GIS):
+            table_b = other.sdf
+
+            if table_b is None:
+                raise ValueError("Other GIS object does not have a Spark DataFrame loaded.")
+
+            # Special GIS handling: OBJECTID is actually NISE
+            if domain_label == "NISE":
+                if "NISE" in table_b.columns:
+                    return table_b
+                elif "OBJECTID" in table_b.columns:
+                    return table_b.withColumnRenamed("OBJECTID", "NISE")
+                else:
+                    raise ValueError(
+                        "GIS DataFrame must contain either 'NISE' or 'OBJECTID' "
+                        "when domain_label='NISE'."
+                    )
+
+            return table_b
+
+        elif isinstance(other, AMI):
+            table_b = other.sdf
+        elif isinstance(other, InfoClientManager):
+            table_b = other.sdf
+        elif isinstance(other, DataFrame):
+            table_b = other
+        else:
+            raise TypeError(f"Unsupported type for 'other': {type(other)}")
+
+        if table_b is None:
+            raise ValueError("Other object does not have a Spark DataFrame loaded.")
+
+        return table_b
+
+    def test_domain(
+            self,
+            other: object,
+            domain_label: str = "NodeID",
+            self_label: str = "self",
+            other_label: str = "other",
+            status_col: str = "domain_status",
+            drop_null_keys: bool = True
+    ) -> DataFrame:
+        """Compare identifier domain against another dataset.
+
+        Returns one Spark DataFrame with one row per
+        distinct key and membership flags.
+
+        Output columns
+        --------------
+        - ``<domain_label>``: normalized key as string
+        - in_self: boolean
+        - in_other: boolean
+        - ``<status_col>``: one of
+            * in_both
+            * only_in_``<self_label>``
+            * only_in_``<other_label>``
+
+        Examples
+        --------
+        >>> audit_df = cdata.test_domain(customers, domain_label="NISE")
+        >>> audit_df.write.format("delta").mode("overwrite").saveAsTable("audit.domain_nise_check")
+        >>> audit_df.groupBy("domain_status").count().show()
+        >>> audit_df.filter(F.col("domain_status") == "only_in_self").show()
+
+        >>> customers = CNFLCustomers()
+        >>> cdata = ConsumptionData()
+        >>> 
+        >>> domain_audit = cdata.test_domain(
+        ...     customers,
+        ...     domain_label="NISE",
+        ...     self_label="consumption",
+        ...     other_label="customers"
+        ... )
+        >>> 
+        >>> domain_audit.show()
+
+        Example output:
+
+        +------+----------------+--------------+---------------------+
+        | NISE | in_consumption | in_customers |    domain_status    |
+        +======+================+==============+=====================+
+        | 1234 |      true      |     true     |       in_both       |
+        +------+----------------+--------------+---------------------+
+        | 5678 |      true      |     false    | only_in_consumption |
+        +------+----------------+--------------+---------------------+
+        | 9999 |      false     |     true     |  only_in_customers  |
+        +------+----------------+--------------+---------------------+
+
+        """
+        if self.sdf is None:
+            raise ValueError("self.sdf is None. Load data first.")
+
+        table_a = self.sdf
+        table_b = self._resolve_other_sdf(other, domain_label)
+        if domain_label not in table_a.columns:
+            raise ValueError(f"Column '{domain_label}' not found in self.sdf")
+
+        if domain_label not in table_b.columns:
+            raise ValueError(f"Column '{domain_label}' not found in other dataset")
+
+        norm_col = "__key"
+        self_flag = f"in_{self_label}"
+        other_flag = f"in_{other_label}"
+
+        a_keys = table_a.select(F.col(domain_label).cast("string").alias(norm_col))
+        b_keys = table_b.select(F.col(domain_label).cast("string").alias(norm_col))
+
+        if drop_null_keys:
+            a_keys = a_keys.filter(F.col(norm_col).isNotNull())
+            b_keys = b_keys.filter(F.col(norm_col).isNotNull())
+
+        a_keys = a_keys.distinct().withColumn(self_flag, F.lit(True))
+        b_keys = b_keys.distinct().withColumn(other_flag, F.lit(True))
+
+        audit_df = (
+            a_keys.alias("a")
+            .join(b_keys.alias("b"), on=norm_col, how="full_outer")
+            .select(
+                F.col(norm_col).alias(domain_label),
+                F.coalesce(F.col(f"a.{self_flag}"), F.lit(False)).alias(self_flag),
+                F.coalesce(F.col(f"b.{other_flag}"), F.lit(False)).alias(other_flag),
+            )
+            .withColumn(
+                status_col,
+                F.when(F.col(self_flag) & F.col(other_flag), F.lit("in_both"))
+                 .when(F.col(self_flag) & ~F.col(other_flag), F.lit(f"only_in_{self_label}"))
+                 .otherwise(F.lit(f"only_in_{other_label}"))
+            )
+        )
+
+        return audit_df
+
 # GIS base (kept mostly local / small; heavy joins done in Spark)
 # ---------------------------------------------------------------
 
 
 @dataclass
-class GIS(ABC):
+class GIS(DomainComparable, ABC):
     """Abstract GIS contract (Spark + optional GeoPandas for visualization).
 
     For scalability, GIS tabular attributes should live in Spark tables.
@@ -31,97 +171,12 @@ class GIS(ABC):
         """Read GIS of each meter into Spark (and optional GeoPandas for maps)."""
         ...
 
-    def test_domain(
-        self,
-        other: object,
-        domain_label: str = "NodeID"
-    ) -> Tuple[DataFrame, DataFrame]:
-        """Compare identifiers between this dataset and another object.
-
-        Returns:
-            in_both: ids present in both datasets
-            in_a_not_b: ids present only in this sdf
-            in_b_not_a: ids present only in other's sdf/df
-
-        Comparison is done on a normalized string representation of `domain_label`
-        to avoid type conflicts and implicit casts.
-
-        """
-        col = domain_label
-        table_a = self.sdf
-
-        if table_a is None:
-            raise ValueError("self.sdf is None. Load data first.")
-
-        # Resolve other into a Spark DataFrame
-        if isinstance(other, GIS) and col == "NISE":
-            table_b = other.sdf
-        elif isinstance(other, AMI):
-            table_b = other.sdf
-        elif isinstance(other, InfoClientManager):
-            table_b = other.sdf
-        elif isinstance(other, DataFrame):
-            table_b = other
-        else:
-            raise TypeError(f"Unsupported type for 'other': {type(other)}")
-
-        if table_b is None:
-            raise ValueError("Other object does not have a Spark DataFrame loaded.")
-
-        norm_col = "__key"
-
-        a_keys = (
-            table_a
-            .select(F.col(col).cast("string").alias(col))
-            .distinct()
-            .withColumn(norm_col, F.col(col))
-        )
-
-        b_keys = (
-            table_b
-            .select(F.col(col).cast("string").alias(col))
-            .distinct()
-            .withColumn(norm_col, F.col(col))
-        )
-
-        diff = (
-            a_keys.alias("a")
-            .join(
-                b_keys.alias("b"),
-                on=[F.col(f"a.{norm_col}") == F.col(f"b.{norm_col}")],
-                how="outer"
-            )
-        )
-
-        # Present in both
-        in_both = (
-            diff
-            .filter(F.col(f"a.{norm_col}").isNotNull() & F.col(f"b.{norm_col}").isNotNull())
-            .select(F.col(f"a.{col}").alias(col))
-        )
-
-        # Present only in A
-        in_a_not_b = (
-            diff
-            .filter(F.col(f"a.{norm_col}").isNotNull() & F.col(f"b.{norm_col}").isNull())
-            .select(F.col(f"a.{col}").alias(col))
-        )
-
-        # Present only in B
-        in_b_not_a = (
-            diff
-            .filter(F.col(f"b.{norm_col}").isNotNull() & F.col(f"a.{norm_col}").isNull())
-            .select(F.col(f"b.{col}").alias(col))
-        )
-
-        return in_both, in_a_not_b, in_b_not_a
-
 # AMI base in Spark
 # -----------------
 
 
 @dataclass
-class AMI(ABC):
+class AMI(DomainComparable, ABC):
     """Abstract AMI device backed by Spark DataFrames."""
 
     sdf: Optional[DataFrame] = None  # main Spark DataFrame
@@ -161,88 +216,6 @@ class AMI(ABC):
         if self.to_ts is not None:
             cond = cond & (F.col(self.ts_col) < F.lit(self.to_ts))
         return sdf.filter(cond)
-
-    def test_domain(
-        self,
-        other: object,
-        domain_label: str = "NodeID"
-    ) -> Tuple[DataFrame, DataFrame]:
-        """Compare identifiers between this AMI dataset and another object.
-
-        Returns:
-            in_both: ids present in both datasets
-            in_a_not_b: ids present only in this sdf
-            in_b_not_a: ids present only in other's sdf/df
-
-        """
-        col = domain_label
-        table_a = self.sdf
-
-        if table_a is None:
-            raise ValueError("self.sdf is None. Load data first.")
-
-        # Resolve other into a Spark DataFrame
-        if isinstance(other, GIS) and col == "NISE":
-            table_b = other.sdf
-        elif isinstance(other, AMI):
-            table_b = other.sdf
-        elif isinstance(other, InfoClientManager):
-            table_b = other.sdf
-        elif isinstance(other, DataFrame):
-            table_b = other
-        else:
-            raise TypeError(f"Unsupported type for 'other': {type(other)}")
-
-        if table_b is None:
-            raise ValueError("Other object does not have a Spark DataFrame loaded.")
-
-        norm_col = "__key"
-
-        a_keys = (
-            table_a
-            .select(F.col(col).cast("string").alias(col))
-            .distinct()
-            .withColumn(norm_col, F.col(col))
-        )
-
-        b_keys = (
-            table_b
-            .select(F.col(col).cast("string").alias(col))
-            .distinct()
-            .withColumn(norm_col, F.col(col))
-        )
-
-        diff = (
-            a_keys.alias("a")
-            .join(
-                b_keys.alias("b"),
-                on=[F.col(f"a.{norm_col}") == F.col(f"b.{norm_col}")],
-                how="outer"
-            )
-        )
-
-        # Present in both
-        in_both = (
-            diff
-            .filter(F.col(f"a.{norm_col}").isNotNull() & F.col(f"b.{norm_col}").isNotNull())
-            .select(F.col(f"a.{col}").alias(col))
-        )
-
-        # Present only in A
-        in_a_not_b = (
-            diff
-            .filter(F.col(f"a.{norm_col}").isNotNull() & F.col(f"b.{norm_col}").isNull())
-            .select(F.col(f"a.{col}").alias(col))
-        )
-
-        # Present only in B
-        in_b_not_a = (
-            diff
-            .filter(F.col(f"b.{norm_col}").isNotNull() & F.col(f"a.{norm_col}").isNull())
-            .select(F.col(f"b.{col}").alias(col))
-        )
-
-        return in_both, in_a_not_b, in_b_not_a
 
     def audit_odd_values(
         self,
@@ -316,11 +289,185 @@ class AMI(ABC):
         self.invalid_value_audit[audit_key] = invalid_df
         return invalid_df
 
+    def write_invalid_value_audit(
+        self,
+        table_name: str = "ami.invalid_value_audit",
+        mode: str = "overwrite",
+        source_name: Optional[str] = None
+    ) -> None:
+        """Write all invalid value audits into a single Delta table.
+
+        Persist all invalid-value audit results stored in ``self.invalid_value_audit``
+        into a single Delta table.
+
+        This method is intended to consolidate the output of previous calls to
+        ``audit_odd_values`` into one Spark/Delta table for easier querying,
+        monitoring, and long-term storage.
+
+        Each entry of ``self.invalid_value_audit`` is expected to be a Spark DataFrame
+        describing invalid raw values detected for a given column. Those individual
+        audit DataFrames are enriched with metadata columns and then unioned into a
+        single Spark DataFrame, which is finally written as a Delta table.
+
+        The resulting Delta table is useful for:
+            - tracking malformed values found in integer-like fields.
+            - monitoring source data quality over time.
+            - building dashboards or SQL reports on invalid values.
+            - comparing invalid-value patterns across different datasets or runs.
+
+        Parameters
+        ----------
+        table_name : str, default "ami.invalid_value_audit"
+            Fully qualified Spark table name where the consolidated audit results
+            will be written.
+
+            Examples:
+                - "ami.invalid_value_audit"
+                - "my_catalog.ami.invalid_value_audit"   (if using Unity Catalog)
+
+            The table will be created automatically if it does not already exist.
+
+        mode : str, default "append"
+            Write mode used when saving the Delta table.
+
+            Common values include:
+                - "append":
+                    Adds the new audit results as new rows in the target Delta table.
+                    This is the recommended mode if you want to preserve audit history
+                    across multiple runs.
+                - "overwrite":
+                    Replaces the contents of the target table with the current audit
+                    results only.
+                - "ignore":
+                    Does nothing if the target table already exists.
+                - "error" or "errorifexists":
+                    Raises an error if the target table already exists.
+
+            In most production audit workflows, "append" is the preferred option.
+
+        source_name : Optional[str], default None
+            Optional label identifying the source object, dataset, or pipeline that
+            generated the audit.
+
+            If provided, a new column named ``source_name`` is added to the output
+            Delta table. This is useful when multiple AMI-derived classes write into
+            the same audit table, for example:
+                - "ConsumptionData"
+                - "VoltageData"
+                - "PowerData"
+
+            If ``None``, the ``source_name`` column is not added.
+
+        Returns
+        -------
+        None
+            This method does not return anything. Its effect is to write the
+            consolidated audit results to the specified Delta table.
+
+        Raises
+        ------
+        ValueError
+            If ``self.invalid_value_audit`` is empty, meaning no audit results are
+            available to write. In that case, you must run ``audit_odd_values`` first
+            or instantiate the class with ``audit_invalid_values=True`` and load data.
+
+        Delta Table Structure
+        ---------------------
+        The generated Delta table contains one row per distinct invalid raw value
+        detected in each audited column.
+
+        Base columns coming from ``audit_odd_values``:
+            - column_name : string
+                Name of the original column that was audited.
+            - invalid_raw_value : string
+                Raw value that did not satisfy the expected validation rule
+                (typically a regex for integer-like values).
+            - invalid_count : bigint
+                Number of times that invalid raw value appeared in the audited data.
+
+        Additional metadata columns added by this method:
+            - audit_key : string
+                Key used in ``self.invalid_value_audit`` to identify the audit result.
+                This is often the same as the column name, but can be different if
+                a custom ``audit_key`` was passed to ``audit_odd_values``.
+            - audit_ts : timestamp
+                Timestamp at which this consolidated audit record was written.
+                Useful for preserving audit history across runs.
+            - source_name : string, optional
+                User-provided label identifying the source dataset/class/process that
+                produced the audit. This column is present only if ``source_name`` is
+                passed to the method.
+
+        Example resulting schema
+        ------------------------
+        If ``source_name`` is provided, the Delta table may look like:
+
+        +-------------------+--------------------+---------------+-------------------+------------------+
+        | column_name       |  invalid_raw_value | invalid_count |     audit_key     | source_name      |
+        +===================+====================+===============+===================+==================+
+        | MEDIDOR           |      X0X07H16      |      25       |      MEDIDOR      | ConsumptionData  |
+        +-------------------+--------------------+---------------+-------------------+------------------+
+        | MEDIDOR           |        N/A         |      7        |      MEDIDOR      | ConsumptionData  |
+        +-------------------+--------------------+---------------+-------------------+------------------+
+        | LOCALIZACION_REAL |        12.3        |      3        | LOCALIZACION_REAL | ConsumptionData  |
+        +-------------------+--------------------+---------------+-------------------+------------------+
+        | LOCALIZACION      |      PLANTA BRA    |      14       |       NISE        | ConsumptionData  |
+        +-------------------+--------------------+---------------+-------------------+------------------+
+
+        Notes
+        -----
+        - This method assumes all DataFrames stored in ``self.invalid_value_audit``
+        share the same base schema produced by ``audit_odd_values``.
+        - The method uses ``unionByName`` to combine all audit DataFrames safely by
+        column name.
+        - When ``mode="append"``, repeated executions will accumulate audit history
+        in the target Delta table.
+        - If you want only the latest audit snapshot, use ``mode="overwrite"``.
+
+        Example
+        -------
+        >>> cdata = ConsumptionData(audit_invalid_values=True)
+        >>> cdata.write_invalid_value_audit(
+        >>>     table_name="ami.invalid_value_audit",
+        >>>     mode="overwrite",
+        >>>     source_name="ConsumptionData"
+        >>> )
+
+        """
+        if not self.invalid_value_audit:
+            message_log: str = (
+                "No invalid value audits found. "
+                "Run audit_odd_values first."
+            )
+            raise ValueError(message_log)
+
+        audit_frames = []
+
+        for audit_key, audit_df in self.invalid_value_audit.items():
+            enriched_df = audit_df.withColumn("audit_key", F.lit(audit_key))
+
+            if source_name is not None:
+                enriched_df = enriched_df.withColumn("source_name", F.lit(source_name))
+
+            audit_frames.append(enriched_df)
+
+        final_df = audit_frames[0]
+        for df in audit_frames[1:]:
+            final_df = final_df.unionByName(df)
+
+        (
+            final_df
+            .write
+            .format("delta")
+            .mode(mode)
+            .saveAsTable(table_name)
+        )
+
 # InfoClientManager base and CNFLCustomers in Spark
 # -------------------------------------------------
 
 @dataclass
-class InfoClientManager(ABC):
+class InfoClientManager(DomainComparable, ABC):
     """Database of some utility's customers."""
     sdf: Optional[DataFrame] = None
 
