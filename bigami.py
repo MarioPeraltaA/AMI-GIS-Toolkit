@@ -11,12 +11,152 @@ import json
 
 spark = SparkSession.getActiveSession()  # in a Databricks notebook / job
 
+
+class DomainComparable():
+    """Shared domain comparison utilities for Spark-backed classes."""
+
+    sdf: Optional[DataFrame] = None
+
+    def _resolve_other_sdf(self, other: object, domain_label: str) -> DataFrame:
+        if isinstance(other, GIS):
+            table_b = other.sdf
+
+            if table_b is None:
+                raise ValueError("Other GIS object does not have a Spark DataFrame loaded.")
+
+            # Special GIS handling: OBJECTID is actually NISE
+            if domain_label == "NISE":
+                if "NISE" in table_b.columns:
+                    return table_b
+                elif "OBJECTID" in table_b.columns:
+                    return table_b.withColumnRenamed("OBJECTID", "NISE")
+                else:
+                    raise ValueError(
+                        "GIS DataFrame must contain either 'NISE' or 'OBJECTID' "
+                        "when domain_label='NISE'."
+                    )
+
+            return table_b
+
+        elif isinstance(other, AMI):
+            table_b = other.sdf
+        elif isinstance(other, InfoClientManager):
+            table_b = other.sdf
+        elif isinstance(other, DataFrame):
+            table_b = other
+        else:
+            raise TypeError(f"Unsupported type for 'other': {type(other)}")
+
+        if table_b is None:
+            raise ValueError("Other object does not have a Spark DataFrame loaded.")
+
+        return table_b
+
+    def test_domain(
+            self,
+            other: object,
+            domain_label: str = "NodeID",
+            self_label: str = "self",
+            other_label: str = "other",
+            status_col: str = "domain_status",
+            drop_null_keys: bool = True
+    ) -> DataFrame:
+        """Compare identifier domain against another dataset.
+
+        Returns one Spark DataFrame with one row per
+        distinct key and membership flags.
+
+        Output columns
+        --------------
+        - ``<domain_label>``: normalized key as string
+        - in_self: boolean
+        - in_other: boolean
+        - ``<status_col>``: one of
+            * in_both
+            * only_in_``<self_label>``
+            * only_in_``<other_label>``
+
+        Examples
+        --------
+        >>> audit_df = cdata.test_domain(customers, domain_label="NISE")
+        >>> audit_df.write.format("delta").mode("overwrite").saveAsTable("audit.domain_nise_check")
+        >>> audit_df.groupBy("domain_status").count().show()
+        >>> audit_df.filter(F.col("domain_status") == "only_in_self").show()
+
+        >>> customers = CNFLCustomers()
+        >>> cdata = ConsumptionData()
+        >>> 
+        >>> domain_audit = cdata.test_domain(
+        ...     customers,
+        ...     domain_label="NISE",
+        ...     self_label="consumption",
+        ...     other_label="customers"
+        ... )
+        >>> 
+        >>> domain_audit.show()
+
+        Example output:
+
+        +------+----------------+--------------+---------------------+
+        | NISE | in_consumption | in_customers |    domain_status    |
+        +======+================+==============+=====================+
+        | 1234 |      true      |     true     |       in_both       |
+        +------+----------------+--------------+---------------------+
+        | 5678 |      true      |     false    | only_in_consumption |
+        +------+----------------+--------------+---------------------+
+        | 9999 |      false     |     true     |  only_in_customers  |
+        +------+----------------+--------------+---------------------+
+
+        """
+        if self.sdf is None:
+            raise ValueError("self.sdf is None. Load data first.")
+
+        table_a = self.sdf
+        table_b = self._resolve_other_sdf(other, domain_label)
+        if domain_label not in table_a.columns:
+            raise ValueError(f"Column '{domain_label}' not found in self.sdf")
+
+        if domain_label not in table_b.columns:
+            raise ValueError(f"Column '{domain_label}' not found in other dataset")
+
+        norm_col = "__key"
+        self_flag = f"in_{self_label}"
+        other_flag = f"in_{other_label}"
+
+        a_keys = table_a.select(F.col(domain_label).cast("string").alias(norm_col))
+        b_keys = table_b.select(F.col(domain_label).cast("string").alias(norm_col))
+
+        if drop_null_keys:
+            a_keys = a_keys.filter(F.col(norm_col).isNotNull())
+            b_keys = b_keys.filter(F.col(norm_col).isNotNull())
+
+        a_keys = a_keys.distinct().withColumn(self_flag, F.lit(True))
+        b_keys = b_keys.distinct().withColumn(other_flag, F.lit(True))
+
+        audit_df = (
+            a_keys.alias("a")
+            .join(b_keys.alias("b"), on=norm_col, how="full_outer")
+            .select(
+                F.col(norm_col).alias(domain_label),
+                F.coalesce(F.col(f"a.{self_flag}"), F.lit(False)).alias(self_flag),
+                F.coalesce(F.col(f"b.{other_flag}"), F.lit(False)).alias(other_flag),
+            )
+            .withColumn(
+                status_col,
+                F.when(F.col(self_flag) & F.col(other_flag), F.lit("in_both"))
+                 .when(F.col(self_flag) & ~F.col(other_flag), F.lit(f"only_in_{self_label}"))
+                 .otherwise(F.lit(f"only_in_{other_label}"))
+            )
+        )
+
+        return audit_df
+
 # GIS base (kept mostly local / small; heavy joins done in Spark)
 # ---------------------------------------------------------------
 
 
 @dataclass
-class GIS(ABC):
+class GIS(DomainComparable, ABC):
     """Abstract GIS contract (Spark + optional GeoPandas for visualization).
 
     For scalability, GIS tabular attributes should live in Spark tables.
@@ -31,97 +171,12 @@ class GIS(ABC):
         """Read GIS of each meter into Spark (and optional GeoPandas for maps)."""
         ...
 
-    def test_domain(
-        self,
-        other: object,
-        domain_label: str = "NodeID"
-    ) -> Tuple[DataFrame, DataFrame]:
-        """Compare identifiers between this dataset and another object.
-
-        Returns:
-            in_both: ids present in both datasets
-            in_a_not_b: ids present only in this sdf
-            in_b_not_a: ids present only in other's sdf/df
-
-        Comparison is done on a normalized string representation of `domain_label`
-        to avoid type conflicts and implicit casts.
-
-        """
-        col = domain_label
-        table_a = self.sdf
-
-        if table_a is None:
-            raise ValueError("self.sdf is None. Load data first.")
-
-        # Resolve other into a Spark DataFrame
-        if isinstance(other, GIS) and col == "NISE":
-            table_b = other.sdf
-        elif isinstance(other, AMI):
-            table_b = other.sdf
-        elif isinstance(other, InfoClientManager):
-            table_b = other.sdf
-        elif isinstance(other, DataFrame):
-            table_b = other
-        else:
-            raise TypeError(f"Unsupported type for 'other': {type(other)}")
-
-        if table_b is None:
-            raise ValueError("Other object does not have a Spark DataFrame loaded.")
-
-        norm_col = "__key"
-
-        a_keys = (
-            table_a
-            .select(F.col(col).cast("string").alias(col))
-            .distinct()
-            .withColumn(norm_col, F.col(col))
-        )
-
-        b_keys = (
-            table_b
-            .select(F.col(col).cast("string").alias(col))
-            .distinct()
-            .withColumn(norm_col, F.col(col))
-        )
-
-        diff = (
-            a_keys.alias("a")
-            .join(
-                b_keys.alias("b"),
-                on=[F.col(f"a.{norm_col}") == F.col(f"b.{norm_col}")],
-                how="outer"
-            )
-        )
-
-        # Present in both
-        in_both = (
-            diff
-            .filter(F.col(f"a.{norm_col}").isNotNull() & F.col(f"b.{norm_col}").isNotNull())
-            .select(F.col(f"a.{col}").alias(col))
-        )
-
-        # Present only in A
-        in_a_not_b = (
-            diff
-            .filter(F.col(f"a.{norm_col}").isNotNull() & F.col(f"b.{norm_col}").isNull())
-            .select(F.col(f"a.{col}").alias(col))
-        )
-
-        # Present only in B
-        in_b_not_a = (
-            diff
-            .filter(F.col(f"b.{norm_col}").isNotNull() & F.col(f"a.{norm_col}").isNull())
-            .select(F.col(f"b.{col}").alias(col))
-        )
-
-        return in_both, in_a_not_b, in_b_not_a
-
 # AMI base in Spark
 # -----------------
 
 
 @dataclass
-class AMI(ABC):
+class AMI(DomainComparable, ABC):
     """Abstract AMI device backed by Spark DataFrames."""
 
     sdf: Optional[DataFrame] = None  # main Spark DataFrame
@@ -161,88 +216,6 @@ class AMI(ABC):
         if self.to_ts is not None:
             cond = cond & (F.col(self.ts_col) < F.lit(self.to_ts))
         return sdf.filter(cond)
-
-    def test_domain(
-        self,
-        other: object,
-        domain_label: str = "NodeID"
-    ) -> Tuple[DataFrame, DataFrame]:
-        """Compare identifiers between this AMI dataset and another object.
-
-        Returns:
-            in_both: ids present in both datasets
-            in_a_not_b: ids present only in this sdf
-            in_b_not_a: ids present only in other's sdf/df
-
-        """
-        col = domain_label
-        table_a = self.sdf
-
-        if table_a is None:
-            raise ValueError("self.sdf is None. Load data first.")
-
-        # Resolve other into a Spark DataFrame
-        if isinstance(other, GIS) and col == "NISE":
-            table_b = other.sdf
-        elif isinstance(other, AMI):
-            table_b = other.sdf
-        elif isinstance(other, InfoClientManager):
-            table_b = other.sdf
-        elif isinstance(other, DataFrame):
-            table_b = other
-        else:
-            raise TypeError(f"Unsupported type for 'other': {type(other)}")
-
-        if table_b is None:
-            raise ValueError("Other object does not have a Spark DataFrame loaded.")
-
-        norm_col = "__key"
-
-        a_keys = (
-            table_a
-            .select(F.col(col).cast("string").alias(col))
-            .distinct()
-            .withColumn(norm_col, F.col(col))
-        )
-
-        b_keys = (
-            table_b
-            .select(F.col(col).cast("string").alias(col))
-            .distinct()
-            .withColumn(norm_col, F.col(col))
-        )
-
-        diff = (
-            a_keys.alias("a")
-            .join(
-                b_keys.alias("b"),
-                on=[F.col(f"a.{norm_col}") == F.col(f"b.{norm_col}")],
-                how="outer"
-            )
-        )
-
-        # Present in both
-        in_both = (
-            diff
-            .filter(F.col(f"a.{norm_col}").isNotNull() & F.col(f"b.{norm_col}").isNotNull())
-            .select(F.col(f"a.{col}").alias(col))
-        )
-
-        # Present only in A
-        in_a_not_b = (
-            diff
-            .filter(F.col(f"a.{norm_col}").isNotNull() & F.col(f"b.{norm_col}").isNull())
-            .select(F.col(f"a.{col}").alias(col))
-        )
-
-        # Present only in B
-        in_b_not_a = (
-            diff
-            .filter(F.col(f"b.{norm_col}").isNotNull() & F.col(f"a.{norm_col}").isNull())
-            .select(F.col(f"b.{col}").alias(col))
-        )
-
-        return in_both, in_a_not_b, in_b_not_a
 
     def audit_odd_values(
         self,
@@ -494,7 +467,7 @@ class AMI(ABC):
 # -------------------------------------------------
 
 @dataclass
-class InfoClientManager(ABC):
+class InfoClientManager(DomainComparable, ABC):
     """Database of some utility's customers."""
     sdf: Optional[DataFrame] = None
 
