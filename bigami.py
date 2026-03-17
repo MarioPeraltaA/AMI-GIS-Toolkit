@@ -316,6 +316,180 @@ class AMI(ABC):
         self.invalid_value_audit[audit_key] = invalid_df
         return invalid_df
 
+    def write_invalid_value_audit(
+        self,
+        table_name: str = "ami.invalid_value_audit",
+        mode: str = "overwrite",
+        source_name: Optional[str] = None
+    ) -> None:
+        """Write all invalid value audits into a single Delta table.
+
+        Persist all invalid-value audit results stored in ``self.invalid_value_audit``
+        into a single Delta table.
+
+        This method is intended to consolidate the output of previous calls to
+        ``audit_odd_values`` into one Spark/Delta table for easier querying,
+        monitoring, and long-term storage.
+
+        Each entry of ``self.invalid_value_audit`` is expected to be a Spark DataFrame
+        describing invalid raw values detected for a given column. Those individual
+        audit DataFrames are enriched with metadata columns and then unioned into a
+        single Spark DataFrame, which is finally written as a Delta table.
+
+        The resulting Delta table is useful for:
+            - tracking malformed values found in integer-like fields.
+            - monitoring source data quality over time.
+            - building dashboards or SQL reports on invalid values.
+            - comparing invalid-value patterns across different datasets or runs.
+
+        Parameters
+        ----------
+        table_name : str, default "ami.invalid_value_audit"
+            Fully qualified Spark table name where the consolidated audit results
+            will be written.
+
+            Examples:
+                - "ami.invalid_value_audit"
+                - "my_catalog.ami.invalid_value_audit"   (if using Unity Catalog)
+
+            The table will be created automatically if it does not already exist.
+
+        mode : str, default "append"
+            Write mode used when saving the Delta table.
+
+            Common values include:
+                - "append":
+                    Adds the new audit results as new rows in the target Delta table.
+                    This is the recommended mode if you want to preserve audit history
+                    across multiple runs.
+                - "overwrite":
+                    Replaces the contents of the target table with the current audit
+                    results only.
+                - "ignore":
+                    Does nothing if the target table already exists.
+                - "error" or "errorifexists":
+                    Raises an error if the target table already exists.
+
+            In most production audit workflows, "append" is the preferred option.
+
+        source_name : Optional[str], default None
+            Optional label identifying the source object, dataset, or pipeline that
+            generated the audit.
+
+            If provided, a new column named ``source_name`` is added to the output
+            Delta table. This is useful when multiple AMI-derived classes write into
+            the same audit table, for example:
+                - "ConsumptionData"
+                - "VoltageData"
+                - "PowerData"
+
+            If ``None``, the ``source_name`` column is not added.
+
+        Returns
+        -------
+        None
+            This method does not return anything. Its effect is to write the
+            consolidated audit results to the specified Delta table.
+
+        Raises
+        ------
+        ValueError
+            If ``self.invalid_value_audit`` is empty, meaning no audit results are
+            available to write. In that case, you must run ``audit_odd_values`` first
+            or instantiate the class with ``audit_invalid_values=True`` and load data.
+
+        Delta Table Structure
+        ---------------------
+        The generated Delta table contains one row per distinct invalid raw value
+        detected in each audited column.
+
+        Base columns coming from ``audit_odd_values``:
+            - column_name : string
+                Name of the original column that was audited.
+            - invalid_raw_value : string
+                Raw value that did not satisfy the expected validation rule
+                (typically a regex for integer-like values).
+            - invalid_count : bigint
+                Number of times that invalid raw value appeared in the audited data.
+
+        Additional metadata columns added by this method:
+            - audit_key : string
+                Key used in ``self.invalid_value_audit`` to identify the audit result.
+                This is often the same as the column name, but can be different if
+                a custom ``audit_key`` was passed to ``audit_odd_values``.
+            - audit_ts : timestamp
+                Timestamp at which this consolidated audit record was written.
+                Useful for preserving audit history across runs.
+            - source_name : string, optional
+                User-provided label identifying the source dataset/class/process that
+                produced the audit. This column is present only if ``source_name`` is
+                passed to the method.
+
+        Example resulting schema
+        ------------------------
+        If ``source_name`` is provided, the Delta table may look like:
+
+        +-------------------+--------------------+---------------+-------------------+------------------+
+        | column_name       |  invalid_raw_value | invalid_count |     audit_key     | source_name      |
+        +===================+====================+===============+===================+==================+
+        | MEDIDOR           |      X0X07H16      |      25       |      MEDIDOR      | ConsumptionData  |
+        +-------------------+--------------------+---------------+-------------------+------------------+
+        | MEDIDOR           |        N/A         |      7        |      MEDIDOR      | ConsumptionData  |
+        +-------------------+--------------------+---------------+-------------------+------------------+
+        | LOCALIZACION_REAL |        12.3        |      3        | LOCALIZACION_REAL | ConsumptionData  |
+        +-------------------+--------------------+---------------+-------------------+------------------+
+        | LOCALIZACION      |      PLANTA BRA    |      14       |       NISE        | ConsumptionData  |
+        +-------------------+--------------------+---------------+-------------------+------------------+
+
+        Notes
+        -----
+        - This method assumes all DataFrames stored in ``self.invalid_value_audit``
+        share the same base schema produced by ``audit_odd_values``.
+        - The method uses ``unionByName`` to combine all audit DataFrames safely by
+        column name.
+        - When ``mode="append"``, repeated executions will accumulate audit history
+        in the target Delta table.
+        - If you want only the latest audit snapshot, use ``mode="overwrite"``.
+
+        Example
+        -------
+        >>> cdata = ConsumptionData(audit_invalid_values=True)
+        >>> cdata.write_invalid_value_audit(
+        >>>     table_name="ami.invalid_value_audit",
+        >>>     mode="overwrite",
+        >>>     source_name="ConsumptionData"
+        >>> )
+
+        """
+        if not self.invalid_value_audit:
+            message_log: str = (
+                "No invalid value audits found. "
+                "Run audit_odd_values first."
+            )
+            raise ValueError(message_log)
+
+        audit_frames = []
+
+        for audit_key, audit_df in self.invalid_value_audit.items():
+            enriched_df = audit_df.withColumn("audit_key", F.lit(audit_key))
+
+            if source_name is not None:
+                enriched_df = enriched_df.withColumn("source_name", F.lit(source_name))
+
+            audit_frames.append(enriched_df)
+
+        final_df = audit_frames[0]
+        for df in audit_frames[1:]:
+            final_df = final_df.unionByName(df)
+
+        (
+            final_df
+            .write
+            .format("delta")
+            .mode(mode)
+            .saveAsTable(table_name)
+        )
+
 # InfoClientManager base and CNFLCustomers in Spark
 # -------------------------------------------------
 
