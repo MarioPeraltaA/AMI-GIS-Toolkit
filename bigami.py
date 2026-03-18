@@ -10,9 +10,17 @@ from pyspark.sql import SparkSession
 import json
 
 spark = SparkSession.getActiveSession()  # in a Databricks notebook / job
+INTEGER_REGEX = r"^[+-]?\d+$"
+DECIMAL_REGEX = r"^[+-]?\d+([.]\d+)?$"
+PHASE_REGEX = r"(?i)^(total|[abc]|tier[abcd])$"
+UNIT_REGEX = r"(?i)^(kWh|Voltage|kW|kVAR|kVARh)$"
+BINARY_REGEX = r"^[01]$"
+SECTOR_REGEX = r"^(Comercial|Residencial|Industrial|SIN TARIFA)$"
+CONSUMPTION_OPERACION_REGEX = r"^(Delivered|Received|A|B|C|a|b|c)$"
+POWER_OPERACION_REGEX = r"^(Delivered|Received)$"
 
 
-class DomainComparable():
+class DomainComparable:
     """Shared domain comparison utilities for Spark-backed classes."""
 
     sdf: Optional[DataFrame] = None
@@ -183,9 +191,12 @@ class AMI(DomainComparable, ABC):
     # Optional generic time filtering
     from_ts: Optional[str] = None     # e.g., "YYYY-MM-DD"
     to_ts: Optional[str] = None       # e.g., "YYYY-MM-DD"
-    ts_col: str = "FECHA_LECTURA_REAL"  # default raw timestamp column name
+    ts_col: str = "FECHA_LECTURA_REAL"   # default raw timestamp column name
     # Stores Spark DataFrames with invalid raw values by audit key
     audit_invalid_values: bool = False
+    audit_rules: dict[str, dict] = field(
+        default_factory=dict       # Modify regarding subclasses
+    )
     invalid_value_audit: dict[str, DataFrame] = field(
         default_factory=dict, init=False
     )
@@ -199,6 +210,29 @@ class AMI(DomainComparable, ABC):
     def set_sdf(self, sdf: DataFrame) -> DataFrame:
         """Process datatype and columns names on a Spark DataFrame."""
         ...
+
+    def run_configured_audits(self, sdf: DataFrame) -> None:
+        """Apply audit odd values regarding rules of subclass."""
+        if not self.audit_invalid_values:
+            return
+
+        for col_name, rule in self.audit_rules.items():
+            if col_name not in sdf.columns:
+                raise ValueError(
+                    f"Audit column '{col_name}' not found in input DataFrame."
+                )
+
+            regex = rule.get("regex", INTEGER_REGEX)
+            audit_key = rule.get("audit_key", col_name)
+            include_nulls = rule.get("include_nulls", False)
+
+            _ = self.audit_odd_values(
+                sdf=sdf,
+                col_name=col_name,
+                valid_regex=regex,
+                audit_key=audit_key,
+                include_nulls=include_nulls
+            )
 
     def _apply_time_filter(self, sdf: DataFrame) -> DataFrame:
         """Apply [from_ts, to_ts) filter if provided.
@@ -221,29 +255,14 @@ class AMI(DomainComparable, ABC):
         self,
         sdf: DataFrame,
         col_name: str,
-        valid_match_regex: str = r"^[+-]?\d+$",
-        audit_key: Optional[str] = None
+        valid_regex: str = r"^[+-]?\d+$",
+        audit_key: Optional[str] = None,
+        include_nulls: bool = False
     ) -> DataFrame:
         """Identify and quantify values that do not follow a regex.
 
         Build a Spark DataFrame with raw
-        values from ``col_name`` that do NOT match a bigint pattern.
-
-        Valid bigint pattern:
-            optional leading sign (+/-), followed by one or more digits
-
-        Examples considered valid:
-            123
-            -45
-            +77
-            00012
-
-        Examples considered invalid:
-            N/A
-            X0X07H16
-            12.3
-            1,000
-            45A
+        values from ``col_name`` that do NOT match a pattern.
 
         Parameters
         ----------
@@ -251,7 +270,7 @@ class AMI(DomainComparable, ABC):
             Input Spark DataFrame.
         col_name : str
             Column to validate/cast.
-        valid_match_regex : str
+        valid_regex : str
             Regex pattern to match. Default is for integer-like
             values suitable for later bigint cast
             optional sign, then digits only.
@@ -267,13 +286,18 @@ class AMI(DomainComparable, ABC):
                 - column_name
 
         Also stores the DataFrame in:
-            self.invalid_value_audit[audit_key or col_name]
+            self.invalid_value_audit[col_name]
 
         """
-
         audit_key = audit_key or col_name
+
         raw_as_str = F.col(col_name).cast("string")
-        invalid_cond = ~raw_as_str.rlike(valid_match_regex)
+        invalid_cond = ~raw_as_str.rlike(valid_regex)
+
+        if include_nulls:
+            invalid_cond = invalid_cond | F.col(col_name).isNull()
+        else:
+            invalid_cond = invalid_cond & F.col(col_name).isNotNull()
 
         invalid_df = (
             sdf
@@ -282,11 +306,12 @@ class AMI(DomainComparable, ABC):
             .groupBy("invalid_raw_value")
             .agg(F.count(F.lit(1)).alias("invalid_count"))
             .withColumn("column_name", F.lit(col_name))
-            .select("column_name", "invalid_raw_value", "invalid_count")
-            # .orderBy(F.desc("invalid_count"), F.asc("invalid_raw_value"))
+            .withColumn("audit_key", F.lit(audit_key))
+            .select("audit_key", "column_name", "invalid_raw_value", "invalid_count")
         )
 
-        self.invalid_value_audit[audit_key] = invalid_df
+        # store by source column name, not audit_key
+        self.invalid_value_audit[col_name] = invalid_df
         return invalid_df
 
     def write_invalid_value_audit(
@@ -443,8 +468,8 @@ class AMI(DomainComparable, ABC):
 
         audit_frames = []
 
-        for audit_key, audit_df in self.invalid_value_audit.items():
-            enriched_df = audit_df.withColumn("audit_key", F.lit(audit_key))
+        for audit_df in self.invalid_value_audit.values():
+            enriched_df = audit_df
 
             if source_name is not None:
                 enriched_df = enriched_df.withColumn("source_name", F.lit(source_name))
@@ -530,22 +555,30 @@ class ConsumptionData(AMI):
     current_data: Optional[DataFrame] = None
     pf_data: Optional[DataFrame] = None
     energy_df: Optional[DataFrame] = None
+    audit_rules: dict[str, dict] = field(default_factory=lambda: {
+        "LOCALIZACION": {"regex": INTEGER_REGEX, "audit_key": "NISE"},
+        "MEDIDOR": {"regex": INTEGER_REGEX},
+        "LOCALIZACION_REAL": {"regex": INTEGER_REGEX},
+        "VALOR_LECTURA": {
+            "regex": DECIMAL_REGEX, "include_nulls": True
+        },
+        "TIPO_SECTOR": {"regex": SECTOR_REGEX},
+        "UNIDAD": {"regex": UNIT_REGEX},
+        "CONTADOR": {"regex": PHASE_REGEX},
+        "MULTIPLICADOR": {"regex": BINARY_REGEX},
+        "OPERACION": {"regex": CONSUMPTION_OPERACION_REGEX}
+    })
 
     def __post_init__(self):
         self.load_data()
         self.set_energy_df()
 
-    def set_sdf(self, sdf: DataFrame) -> DataFrame:
+    def set_sdf(
+            self,
+            sdf: DataFrame
+    ) -> DataFrame:
         """Process datatype and add hour column, robust to malformed values."""
-        if self.audit_invalid_values:
-            # Audit bad raw values first, without casting
-            _ = self.audit_odd_values(
-                sdf,
-                "LOCALIZACION",
-                audit_key="NISE" # This field it is actually the NISE
-            )
-            _ = self.audit_odd_values(sdf, "MEDIDOR")
-            _ = self.audit_odd_values(sdf, "LOCALIZACION_REAL")
+        self.run_configured_audits(sdf)
 
         sdf = (
             sdf
@@ -646,7 +679,9 @@ class ConsumptionData(AMI):
         self.sdf = sdf
 
         # Filter out transformer meters
-        df = sdf.filter(F.col("SGDA").isin([None, "Bidireccional"]))
+        df = sdf.filter(
+            F.col("SGDA").isNull() | (F.col("SGDA") == "Bidireccional")
+        )
 
         # ENE and MDE
         self.ene_data, self.mde_data = self.split_ene_mde(df)
@@ -678,10 +713,6 @@ class ConsumptionData(AMI):
             )
         )
 
-        # Sort
-        window_by_meter = (
-            F.window(F.col("FECHA_LECTURA"), "99999 days")  # dummy; we'll use analytic window
-        )
         from pyspark.sql.window import Window
         w = Window.partitionBy("MEDIDOR").orderBy("FECHA_LECTURA")
 
@@ -728,22 +759,26 @@ class VoltageData(AMI):
     ts_col: str = "FECHA_LECTURA_REAL"
     voltage_data: Optional[DataFrame] = None
     voltage_df: Optional[DataFrame] = None
+    audit_rules: dict[str, dict] = field(default_factory=lambda: {
+        "LOCALIZACION": {"regex": INTEGER_REGEX, "audit_key": "NISE"},
+        "MEDIDOR": {"regex": INTEGER_REGEX},
+        "LOCALIZACION_REAL": {"regex": INTEGER_REGEX},
+        "VALOR_LECTURA": {
+            "regex": DECIMAL_REGEX, "include_nulls": True
+        },
+        "UNIDAD": {"regex": r'^Phase [ABC] Average RMS Voltage$'}
+    })
 
     def __post_init__(self):
         self.load_data()
         self.set_voltage_df()
 
-    def set_sdf(self, sdf: DataFrame) -> DataFrame:
+    def set_sdf(
+            self,
+            sdf: DataFrame
+    ) -> DataFrame:
         """Process datatype, robust to malformed values."""
-        if self.audit_invalid_values:
-            # Audit bad raw values first, without casting
-            _ = self.audit_odd_values(
-                sdf,
-                "LOCALIZACION",
-                audit_key="NISE" # This field it is actually the NISE
-            )
-            _ = self.audit_odd_values(sdf, "MEDIDOR")
-            _ = self.audit_odd_values(sdf, "LOCALIZACION_REAL")
+        self.run_configured_audits(sdf)
 
         sdf = (
             sdf
@@ -838,23 +873,29 @@ class PowerData(AMI):
     kvarh_data: Optional[DataFrame] = None
     active_df: Optional[DataFrame] = None
     reactive_df: Optional[DataFrame] = None
+    audit_rules: dict[str, dict] = field(default_factory=lambda: {
+        "LOCALIZACION": {"regex": INTEGER_REGEX, "audit_key": "NISE"},
+        "MEDIDOR": {"regex": INTEGER_REGEX},
+        "LOCALIZACION_REAL": {"regex": INTEGER_REGEX},
+        "VALOR_LECTURA": {
+            "regex": DECIMAL_REGEX, "include_nulls": True
+        },
+        "UNIDAD": {"regex": r"(?i)^(kWh|kW|kVAR|kVARh)$"},
+        "CONSTANTE": {"regex": INTEGER_REGEX},
+        "OPERACION": {"regex": POWER_OPERACION_REGEX}
+    })
 
     def __post_init__(self):
         self.load_data()
         self.set_active_df()
         self.set_reactive_df()
 
-    def set_sdf(self, sdf: DataFrame) -> DataFrame:
+    def set_sdf(
+            self,
+            sdf: DataFrame
+    ) -> DataFrame:
         """Process datatype, robust to malformed values."""
-        if self.audit_invalid_values:
-            # Audit bad raw values first, without casting
-            _ = self.audit_odd_values(
-                sdf,
-                "LOCALIZACION",
-                audit_key="NISE" # This field it is actually the NISE
-            )
-            _ = self.audit_odd_values(sdf, "MEDIDOR")
-            _ = self.audit_odd_values(sdf, "LOCALIZACION_REAL")
+        self.run_configured_audits(sdf)
 
         sdf = (
             sdf
@@ -916,7 +957,9 @@ class PowerData(AMI):
         sdf = self.set_sdf(sdf)
         self.sdf = sdf
 
-        df = sdf.filter(F.col("SGDA").isin([None, "Bidireccional"]))
+        df = sdf.filter(
+            F.col("SGDA").isNull() | (F.col("SGDA") == "Bidireccional")
+        )
         kwh_data, kvarh_data = self.split_power(df)
 
         select_cols = [

@@ -7,6 +7,7 @@ Author::
 For feedback::
 
     mario.peralta@ieee.org
+
 """
 
 from dataclasses import dataclass, field
@@ -35,7 +36,7 @@ class DomainComparable:
             table_b = other.gdf
 
             if table_b is None:
-                message_log = (
+                message_log: str = (
                     "Other GIS object does not have a GeoDataFrame loaded."
                 )
                 raise ValueError(message_log)
@@ -47,10 +48,11 @@ class DomainComparable:
                 elif "OBJECTID" in table_b.columns:
                     return table_b.rename(columns={"OBJECTID": "NISE"}).copy()
                 else:
-                    raise ValueError(
-                        "GIS GeoDataFrame must contain either 'NISE' or 'OBJECTID' "
-                        "when domain_label='NISE'."
+                    message_log: str = (
+                        "GIS GeoDataFrame must contain either "
+                        "'NISE' or 'OBJECTID' when domain_label='NISE'."
                     )
+                    raise ValueError(message_log)
 
             return table_b.copy()
 
@@ -79,7 +81,8 @@ class DomainComparable:
     ) -> pd.DataFrame:
         """Compare identifier domain against another dataset.
 
-        Returns one DataFrame with one row per distinct key and membership flags.
+        Returns one DataFrame with one row per distinct
+        key and membership flags.
 
         Output columns
         --------------
@@ -99,10 +102,14 @@ class DomainComparable:
         table_b = self._resolve_other_df(other, domain_label)
 
         if domain_label not in table_a.columns:
-            raise ValueError(f"Column '{domain_label}' not found in self.df")
+            raise ValueError(
+                f"Column '{domain_label}' not found in self.df"
+            )
 
         if domain_label not in table_b.columns:
-            raise ValueError(f"Column '{domain_label}' not found in other dataset")
+            raise ValueError(
+                f"Column '{domain_label}' not found in other dataset"
+            )
 
         self_flag = f"in_{self_label}"
         other_flag = f"in_{other_label}"
@@ -130,8 +137,16 @@ class DomainComparable:
             how="outer"
         )
 
-        audit_df[self_flag] = audit_df[self_flag].fillna(False).astype(bool)
-        audit_df[other_flag] = audit_df[other_flag].fillna(False).astype(bool)
+        audit_df[self_flag] = (
+            audit_df[self_flag]
+            .astype('boolean')
+            .fillna(False)
+        )
+        audit_df[other_flag] = (
+            audit_df[other_flag]
+            .astype('boolean')
+            .fillna(False)
+        )
 
         audit_df[status_col] = np.where(
             audit_df[self_flag] & audit_df[other_flag],
@@ -213,7 +228,28 @@ class InfoClientManager(DomainComparable, ABC):
         other_attr: str = "TIPO_SECTOR",
         date_col: str = "FECHA_LECTURA"
     ) -> pd.DataFrame | None:
-        """Compare whether entity attributes agree across two data sources."""
+        """Compare whether entity attributes agree across two data sources.
+
+        Verify and flag whether two systems report
+        the same information about the same entity.
+
+        .. Note::
+
+            If the ``other`` object it is a time series
+            the latest value is assumed to be the valid one.
+
+        .. Warning::
+
+            This works better if attributes to compare
+            to each other are categorical.
+
+        .. Warning::
+
+            Make sure data type of entity keys is
+            consistent with the structures under
+            comparison.
+
+        """
         self_df = self.df
         if self_df is None:
             raise ValueError("self.df is None.")
@@ -278,7 +314,10 @@ class CNFLCustomers(InfoClientManager):
             self.columns_dtype = dtype_map
             return dtype_map
 
-    def process_info_data(self, info_df: pd.DataFrame):
+    def process_info_data(
+            self,
+            info_df: pd.DataFrame
+    ):
         """Clean up and normalize customers dataset."""
         date_cols: list[str] = [
             "FEC_INST_NISE",
@@ -300,7 +339,10 @@ class CNFLCustomers(InfoClientManager):
             info_df["NISE"].astype("string").str.strip()
             .replace(r"^(\d+),0+$", r"\1", regex=True)
         )
-        info_df["NISE"] = pd.to_numeric(info_df["NISE"], errors="coerce").astype("Int64")
+        info_df["NISE"] = (
+            pd.to_numeric(info_df["NISE"], errors="coerce")
+            .astype("Int64")
+        )
 
         return info_df
 
@@ -332,11 +374,16 @@ class GISCircuit(GIS):
         self.paint_layers()
         self.gdf = self.layers[self.customers_layer_name][0]
 
-        if "OBJECTID" in self.gdf.columns and "NISE" not in self.gdf.columns:
+        if (
+            "OBJECTID" in self.gdf.columns
+            and "NISE" not in self.gdf.columns
+        ):
             self.gdf = self.gdf.rename(columns={"OBJECTID": "NISE"})
 
         # for compatibility with DomainComparable
-        self.df = pd.DataFrame(self.gdf.drop(columns="geometry", errors="ignore"))
+        self.df = pd.DataFrame(
+            self.gdf.drop(columns="geometry", errors="ignore")
+        )
 
     def set_layer(
         self,
@@ -364,7 +411,29 @@ class GISCircuit(GIS):
             "NUMEROMEDI": "MEDIDOR"
         }
     ) -> gpd.GeoDataFrame | None:
-        """Read a GIS file and return a GeoDataFrame with a consistent CRS."""
+        """Read a GIS file and return a GeoDataFrame with a consistent CRS.
+
+        By default, the data is returned in EPSG:4326 (WGS84), which is
+        required for Folium compatibility. If ``to_local=True``, the data
+        is reprojected to the specified local EPSG code, typically used
+        for utility-scale electrical modeling (e.g., EPSG:5367 in Costa Rica).
+
+        Parameters
+        ----------
+        path : str
+            File path to the GIS data.
+        epsg : int, optional
+            EPSG code of the local projection to use. Default is 5367.
+        to_local : bool, optional
+            If True, the GeoDataFrame is returned in the local projection.
+            If False (default), it is returned in EPSG:4326.
+
+        Returns
+        -------
+        geopandas.GeoDataFrame or None
+            GeoDataFrame in the requested CRS, or None if reading fails.
+
+        """
         try:
             gdf = gpd.read_file(path)
             gdf = self.set_layer(gdf, rename_cols=rename_cols)
@@ -386,7 +455,12 @@ class GISCircuit(GIS):
         return gdf
 
     def load_gis(self):
-        """Read all GIS layers."""
+        """Read all GIS layers.
+
+        If :py:attr:`GISCircuit.per_slice` is ``None``
+        it will take the whole data set.
+
+        """
         shapefiles: list[str] = glob.glob(self.gis_path)
 
         for shp_path in shapefiles:
@@ -405,8 +479,16 @@ class GISCircuit(GIS):
                 else:
                     self.layers[layer_name] = [gdf]
 
-    def paint_layers(self, seed: int = 7859) -> dict[str, list[str]]:
-        """Assign eye-catching color to each layer."""
+    def paint_layers(
+            self,
+            seed: int = 7859
+    ) -> dict[str, list[str]]:
+        """Assign eye-cathing color to each layer.
+
+        Uses ``rng.shuffle`` instead of ``rng.integers`` to make sure
+        all colors are different.
+
+        """
         lib_colors = list(plt.cm.colors.cnames)
         size = len(self.layers)
         rng = np.random.default_rng(seed=seed)
@@ -420,7 +502,11 @@ class GISCircuit(GIS):
         return self.layers
 
     def explore_network(self) -> folium.Map:
-        """Map of the circuit."""
+        """Map of the circuit.
+
+        Go easy on the number of elements.
+
+        """
         ckt_map = folium.Map(
             crs="EPSG3857",
             zoom_start=15,
@@ -439,14 +525,57 @@ class GISCircuit(GIS):
                 show=False
             )
 
-        folium.TileLayer("Cartodb dark_matter", show=False).add_to(ckt_map)
+        folium.TileLayer(
+            "Cartodb dark_matter", show=False
+        ).add_to(ckt_map)
         folium.LayerControl().add_to(ckt_map)
         return ckt_map
 
 
 @dataclass
 class ConsumptionData(AMI):
-    """Data structure for managing and analyzing energy consumption profiles."""
+    r"""Data structure for managing and analyzing energy consumption profiles.
+
+    This class handles energy-related measurements obtained from
+    AMI (Advanced Metering Infrastructure) systems. It gathers and
+    organizes instantaneous power, voltage data, and daily energy
+    consumption increments (:math:`\Delta` Energy).
+
+    **Sampling Frequency:**
+    The intended sampling frequency is **one measurement per day**.
+    However, actual intervals may vary depending on the meter
+    configuration and data availability.
+
+    Attributes
+    ----------
+    data_path : str
+        Default directory path for storing or loading energy consumption data.
+    gis : GISCircuit | None
+        Optional GIS circuit object associated with the dataset, used for
+        spatial analysis or network mapping.
+    df : pandas.DataFrame | None
+        Raw AMI dataset containing power, voltage, and energy measurements.
+    ene_data : pandas.DataFrame | None
+        ...
+    mde_data : pandas.DataFrame | None
+        ...
+    power_data : pandas.DataFrame | None
+        Instantaneous active kW, reactive kVAR and mag. apparent kVA
+        power either demanded from the network or injected to it.
+    voltage_data : pandas.DataFrame | None
+        ...
+    current_data : pandas.DataFrame | None
+        ...
+    pf_data : pandas.DataFrame | None
+        ...
+    energy_df : pandas.DataFrame | None
+        Processed daily energy increments (:math:`\Delta` kWh), suitable for
+        time-series analysis and load profiling.
+    ami_gdf : geopandas.GeoDataFrame | None
+        Geospatial representation of AMI devices and measurements, useful for
+        visualization and spatial queries.
+
+    """
 
     data_path: str = "./Data/Consumption"
     gis: GISCircuit | None = None
@@ -478,11 +607,19 @@ class ConsumptionData(AMI):
             df["LOCALIZACION"].astype("string").str.strip()
             .replace(r"^(\d+),0+$", r"\1", regex=True)
         )
-        df["NISE"] = pd.to_numeric(df["LOCALIZACION"], errors="coerce").astype("Int64")
+        df["NISE"] = (
+            pd.to_numeric(df["LOCALIZACION"], errors="coerce")
+            .astype("Int64")
+        )
         df.drop(columns=["LOCALIZACION"], inplace=True)
 
-        df["VALOR_LECTURA"] = pd.to_numeric(df["VALOR_LECTURA"], errors="coerce")
-        df["MEDIDOR"] = pd.to_numeric(df["MEDIDOR"], errors="coerce").astype("Int64")
+        df["VALOR_LECTURA"] = pd.to_numeric(
+            df["VALOR_LECTURA"], errors="coerce"
+        )
+        df["MEDIDOR"] = (
+            pd.to_numeric(df["MEDIDOR"], errors="coerce")
+            .astype("Int64")
+        )
         df["LOCALIZACION_REAL"] = pd.to_numeric(
             df["LOCALIZACION_REAL"], errors="coerce"
         ).astype("Int64")
@@ -508,8 +645,18 @@ class ConsumptionData(AMI):
             & (df.CONTADOR == "total")
             & (df.TIPO_CONSUMO != "FPO")
         ]
-        ene_df = ene_mde_df[ene_mde_df.TIPO_CONSUMO.astype(str).str.contains("ENE", na=False)]
-        mde_df = ene_mde_df[ene_mde_df.TIPO_CONSUMO.astype(str).str.contains("MDE", na=False)]
+        ene_df = ene_mde_df[
+            ene_mde_df.TIPO_CONSUMO
+            .astype(str)
+            .str
+            .contains("ENE", na=False)
+        ]
+        mde_df = ene_mde_df[
+            ene_mde_df.TIPO_CONSUMO
+            .astype(str)
+            .str
+            .contains("MDE", na=False)
+        ]
         return ene_df.reset_index(drop=True), mde_df.reset_index(drop=True)
 
     def get_power(
@@ -553,7 +700,26 @@ class ConsumptionData(AMI):
         ].reset_index(drop=True)
 
     def load_data(self):
-        """Read and set raw daily dirty data."""
+        """Read and set raw daily dirty data.
+
+        Regarding meter function (SGDA) filter transformer meters out:
+
+            Either None or Bidireccional
+        ENE and MDE either Delivered or Received but without FPO:
+
+            CONTADOR (total) OPERACION (Delivered, Received)
+            TIPO_CONSUMO (filter FPO out).
+
+        Phase analysis:
+
+            CONTADOR (a, b, c) and OPERACION (A, B, C) gets
+
+                - kW, kVAR, kVA
+                - Voltage, Voltage Angle
+                - Current, Current Angle
+                - Power Factor, Power Factor Angle
+
+        """
         df = pd.read_parquet(self.data_path)
         df = self.set_df(df)
         self.df = df.copy()
@@ -594,7 +760,9 @@ class ConsumptionData(AMI):
 
         self.energy_df = kwh_df
 
-    def n_phases(self) -> pd.DataFrame:
+    def n_phases(
+            self
+    ) -> pd.DataFrame:
         """Count number of phases of each meter."""
         if self.voltage_data is None:
             raise ValueError("voltage_data not loaded.")
@@ -610,7 +778,20 @@ class ConsumptionData(AMI):
         node_col_label: str = "MEDIDOR",
         geo_of_col: str = "LOCALIZACION_REAL"
     ) -> gpd.GeoDataFrame:
-        """Map meter location to actual geometry point."""
+        """Map meter location to actual geometry point.
+
+        As long as ami device location is not None
+        and such location exists in GIS data.
+
+        .. Note::
+
+            Drop duplicates between ``MEDIDOR`` and ``NISE``
+            so that it is force to map one meter to one
+            customer NISE although one customer may have
+            multiple meters, this is only for visualization
+            purposes.
+
+        """
         if self.gis is None:
             raise ValueError("gis is None.")
 
@@ -635,7 +816,35 @@ class ConsumptionData(AMI):
 
 @dataclass
 class VoltageData(AMI):
-    """Data structure for managing and analyzing daily voltage profiles."""
+    """Data structure for managing and analyzing daily voltage profiles.
+
+    This class is designed to handle voltage measurements collected from
+    AMI (Advanced Metering Infrastructure) systems. It focuses on daily
+    profiles, typically sampled at regular intervals.
+
+    **Expected Sampling Frequency:**
+    Voltage measurements are generally expected every 5, 10, or 15 minutes.
+    However, only a limited number of key customers may have meters configured
+    to record voltage at such high temporal resolution. Further more
+    it looks like most of them measure only at one phase.
+
+    Attributes
+    ----------
+    data_path : str
+        Default directory path for storing or loading voltage data files.
+    gis : GISCircuit | None
+        Optional GIS circuit object associated with the dataset. Used for
+        spatial analysis or network mapping.
+    df : pandas.DataFrame | None
+        Raw AMI dataset containing voltage measurements and metadata.
+    voltage_df : pandas.DataFrame | None
+        Processed voltage data, typically cleaned
+        and time-indexed for analysis.
+    ami_gdf : geopandas.GeoDataFrame | None
+        Geospatial representation of AMI devices and measurements, useful for
+        visualization and spatial queries.
+
+    """
 
     data_path: str = "./Data/Voltages"
     phase_vals: list[str] = field(
@@ -660,17 +869,27 @@ class VoltageData(AMI):
             df["LOCALIZACION"].astype("string").str.strip()
             .replace(r"^(\d+),0+$", r"\1", regex=True)
         )
-        df["NISE"] = pd.to_numeric(df["LOCALIZACION"], errors="coerce").astype("Int64")
+        df["NISE"] = (
+            pd.to_numeric(df["LOCALIZACION"], errors="coerce")
+            .astype("Int64")
+        )
         df.drop(columns=["LOCALIZACION"], inplace=True)
 
-        df["VALOR_LECTURA"] = pd.to_numeric(df["VALOR_LECTURA"], errors="coerce")
-        df["MEDIDOR"] = pd.to_numeric(df["MEDIDOR"], errors="coerce").astype("Int64")
+        df["VALOR_LECTURA"] = (
+            pd.to_numeric(df["VALOR_LECTURA"], errors="coerce")
+        )
+        df["MEDIDOR"] = (
+            pd.to_numeric(df["MEDIDOR"], errors="coerce")
+            .astype("Int64")
+        )
         df["FECHA_LECTURA"] = df["FECHA_LECTURA_REAL"]
 
         df["UNIDAD"] = df["UNIDAD"].astype(str)
         df = df[df["UNIDAD"].isin(self.phase_vals)]
 
-        df = df.sort_values(by=["MEDIDOR", "FECHA_LECTURA"]).reset_index(drop=True)
+        df = df.sort_values(
+            by=["MEDIDOR", "FECHA_LECTURA"]
+        ).reset_index(drop=True)
         return df
 
     def load_data(self):
@@ -703,7 +922,39 @@ class VoltageData(AMI):
 
 @dataclass
 class PowerData(AMI):
-    """Data structure for managing and analyzing daily power profiles."""
+    """Data structure for managing and analyzing daily power profiles.
+
+    This class handles active and reactive power measurements collected from
+    AMI (Advanced Metering Infrastructure) systems at high temporal resolution
+    (typically every 10 or 15 minutes). Energy and power data are
+    organized into separate structures for active and
+    reactive components, enabling flexible
+    analysis of load profiles and network behavior.
+
+    **Attributes**
+    ----------
+    data_path : str
+        Default directory path for storing or loading power data files.
+    gis : GISCircuit | None
+        Optional GIS circuit object associated with the dataset, used for
+        spatial analysis or network mapping.
+    df : pandas.DataFrame | None
+        Raw AMI dataset containing both active and reactive power measurements.
+    kwh_data : pandas.DataFrame | None
+        Raw energy data (kWh) representing active energy consumption over time.
+    kvarh_data : pandas.DataFrame | None
+        Raw energy data (kVArh) representing reactive energy measurements.
+    active_df : pandas.DataFrame | None
+        Processed active power dataset, typically cleaned and time-indexed for
+        load profile analysis.
+    reactive_df : pandas.DataFrame | None
+        Processed reactive power dataset, typically cleaned and
+        time-indexed for network behavior analysis.
+    ami_gdf : geopandas.GeoDataFrame | None
+        Geospatial representation of AMI devices and measurements, useful for
+        visualization and spatial queries.
+
+    """
 
     data_path: str = "./Data/Power"
     gis: GISCircuit | None = None
@@ -728,17 +979,27 @@ class PowerData(AMI):
             df["LOCALIZACION"].astype("string").str.strip()
             .replace(r"^(\d+),0+$", r"\1", regex=True)
         )
-        df["NISE"] = pd.to_numeric(df["LOCALIZACION"], errors="coerce").astype("Int64")
+        df["NISE"] = (
+            pd.to_numeric(df["LOCALIZACION"], errors="coerce")
+            .astype("Int64")
+        )
         df.drop(columns=["LOCALIZACION"], inplace=True)
 
-        df["VALOR_LECTURA"] = pd.to_numeric(df["VALOR_LECTURA"], errors="coerce")
-        df["MEDIDOR"] = pd.to_numeric(df["MEDIDOR"], errors="coerce").astype("Int64")
+        df["VALOR_LECTURA"] = pd.to_numeric(
+            df["VALOR_LECTURA"], errors="coerce"
+        )
+        df["MEDIDOR"] = (
+            pd.to_numeric(df["MEDIDOR"], errors="coerce")
+            .astype("Int64")
+        )
         df["LOCALIZACION_REAL"] = pd.to_numeric(
             df["LOCALIZACION_REAL"], errors="coerce"
         ).astype("Int64")
         df["FECHA_LECTURA"] = df["FECHA_LECTURA_REAL"]
 
-        df = df.sort_values(by=["MEDIDOR", "FECHA_LECTURA"]).reset_index(drop=True)
+        df = df.sort_values(
+            by=["MEDIDOR", "FECHA_LECTURA"]
+        ).reset_index(drop=True)
         return df
 
     def split_power(
@@ -774,7 +1035,19 @@ class PowerData(AMI):
         self.kvarh_data = kvarh_data[columns].reset_index(drop=True)
 
     def set_active_df(self):
-        """Restructure original data set."""
+        """Restructure original data set.
+
+        Both ``Delivered`` and ``Received`` fields
+        become nested in either ``ENERGIA`` and ``DEMANDA``.
+        Sort by date and assume everyone sends and
+        receives power but in case they don't then it
+        is either zero or filled up with `NaN`.
+
+        .. Note::
+
+            Columns are labeled from load's perspective.
+
+        """
         if self.kwh_data is None:
             raise ValueError("kwh_data not loaded.")
 
@@ -798,11 +1071,21 @@ class PowerData(AMI):
             ("ENERGIA", "Received"): ("E", "Egen"),
         }
 
-        active_df.columns = active_df.columns.map(lambda c: rename_dict.get(c, c))
+        active_df.columns = active_df.columns.map(
+            lambda c: rename_dict.get(c, c)
+        )
         self.active_df = active_df
 
     def set_reactive_df(self):
-        """Restructure original data set."""
+        """Restructure original data set.
+
+        Both ``Delivered`` and ``Received`` fields
+        become nested in either ``ENERGIA`` and ``DEMANDA``.
+        Sort by date and assume everyone sends and
+        receives power but in case they don't then it
+        is either zero or filled up with `NaN`.
+
+        """
         if self.kvarh_data is None:
             raise ValueError("kvarh_data not loaded.")
 
@@ -826,14 +1109,28 @@ class PowerData(AMI):
             ("ENERGIA", "Received"): ("E", "Egen"),
         }
 
-        reactive_df.columns = reactive_df.columns.map(lambda c: rename_dict.get(c, c))
+        reactive_df.columns = reactive_df.columns.map(
+            lambda c: rename_dict.get(c, c)
+        )
         self.reactive_df = reactive_df
 
     def flat_df(
         self,
         df: pd.DataFrame
     ) -> pd.DataFrame:
-        """Turn nested structure into flat one."""
+        """Turn nested structure into flat one.
+
+        By kicking out falsy columns: None, False, ""
+        for top level columns and join those with
+        inner columns with underscore e.g::
+
+            df[[("node", ""), ("ts", ""), ("P", "Pdem")]]
+
+        Becomes::
+
+            df[["node", "ts", "P_Pdem"]]
+
+        """
         flat_df = df.copy()
         flat_df.columns = [
             "_".join(filter(None, col)) if isinstance(col, tuple) else col
@@ -844,7 +1141,18 @@ class PowerData(AMI):
 
 @dataclass
 class ScenariosManager(ABC):
-    """Use data to make up scenarios."""
+    """Use data to make up scenarios.
+
+    Smart City and Microgrid loadshapes.
+    Vitual potential realities so to speak, in case of
+    a University campus these could be the scenarios:
+
+        - Weekdays of each academic season.
+        - Weekdays on vacations.
+        - Weekends throughout the year.
+        - The event of maximum possible demand.
+
+    """
 
     df: pd.DataFrame
     pdata: PowerData | None = None
@@ -881,7 +1189,33 @@ class CityScenarios(ScenariosManager):
             12: "V"
         }
     ) -> pd.DataFrame:
-        """Classify demand nature based on seasons."""
+        """Classify demand nature based on seasons.
+
+        Let default seasons be I, II, III, v then::
+
+            seasons = {
+                1: "III",
+                2: "III",
+                3: "I",
+                4: "I",
+                5: "I",
+                6: "I",
+                7: "V",
+                8: "II",
+                9: "II",
+                10: "II",
+                11: "II",
+                12: "V"
+            }
+
+        Where each number represents the month respectively.
+
+        .. Note::
+
+            Seasons only consider weekdays. To play around with
+            weekends see :py:meth:`ScenariosManager.weekend_curve`
+
+        """
         df = df.copy()
         df["season"] = df["ts"].dt.month.map(seasons_map)
         return df
@@ -890,7 +1224,12 @@ class CityScenarios(ScenariosManager):
         self,
         df: pd.DataFrame
     ) -> pd.DataFrame:
-        """Set labels up of an academic Microgrid."""
+        """Set labels up of an academic Microgrid.
+
+        Retain only those days with 96 samples so
+        acrossed average demand is consistent over time.
+
+        """
         df = df.copy()
         df["day"] = df["ts"].dt.weekday.map(
             lambda x: "weekend" if x >= 5 else "weekday"
@@ -914,7 +1253,10 @@ class CityScenarios(ScenariosManager):
         )
         return df
 
-    def get_weekends_curve(self, power: str = "P") -> pd.DataFrame:
+    def get_weekends_curve(
+        self,
+        power: str = "P"
+    ) -> pd.DataFrame:
         """Retrieve weekends and compute average throughout time."""
         wend = self.sdata[self.sdata["day"] == "weekend"].copy()
         wend["timestep"] = wend.groupby(["node", "date"]).cumcount()
@@ -929,10 +1271,16 @@ class CityScenarios(ScenariosManager):
         self.weekends_curve = wend_avg_shape
         return wend_avg_shape
 
-    def avg_curves(self, power: str = "P") -> pd.DataFrame:
+    def avg_curves(
+        self,
+        power: str = "P"
+    ) -> pd.DataFrame:
         """Compute average load shape of each weekday season."""
         wday = self.sdata[self.sdata["day"] == "weekday"].copy()
-        wday["timestep"] = wday.groupby(["season", "node", "date"]).cumcount()
+        wday["timestep"] = (
+            wday.groupby(["season", "node", "date"])
+            .cumcount()
+        )
 
         wday_avg_shape = (
             wday.groupby(["season", "node", "timestep"])[power]
