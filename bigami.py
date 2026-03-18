@@ -16,8 +16,8 @@ PHASE_REGEX = r"(?i)^(total|[abc]|tier[abcd])$"
 UNIT_REGEX = r"(?i)^(kWh|Voltage|kW|kVAR|kVARh)$"
 BINARY_REGEX = r"^[01]$"
 SECTOR_REGEX = r"^(Comercial|Residencial|Industrial|SIN TARIFA)$"
-CONSUMPTION_OPERACION_REGEX = r"^(Delivered|Received|A|B|C|a|b|c)$"
-POWER_OPERACION_REGEX = r"^(Delivered|Received)$"
+CONSUMPTION_OPERACION_REGEX = r"^(Delivered|Received|Sum|A|B|C|a|b|c)$"
+POWER_OPERACION_REGEX = r"^(Delivered|Received|Sum)$"
 
 
 class DomainComparable:
